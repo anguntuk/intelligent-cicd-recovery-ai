@@ -1,11 +1,11 @@
 name: Frontend Failure Diagnostics
 
-# Automatic mode: analyze only failed frontend runs from feature/* branches.
-# Manual mode: dispatch from the default branch and provide a failed feature/* run ID.
+# Automatic: run after Frontend CI completes on feature/* branches.
+# Manual: dispatch this workflow from the default branch and enter a failed run ID.
 on:
   workflow_run:
     workflows:
-      - Frontend CI - Failure Scenarios
+      - Frontend CI
     types:
       - completed
     branches:
@@ -16,26 +16,20 @@ on:
         description: Failed Frontend CI workflow run ID to analyze
         required: true
         type: string
-      run_attempt:
-        description: Specific attempt number (leave blank for the latest attempt)
-        required: false
-        type: string
 
 permissions:
   actions: read
   contents: read
 
 concurrency:
-  group: frontend-diagnostics-${{ github.event.workflow_run.id || inputs.run_id }}-${{ github.event.workflow_run.run_attempt || inputs.run_attempt || 'latest' }}
+  group: frontend-diagnostics-${{ github.event.workflow_run.id || inputs.run_id || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   diagnose:
     name: Analyze failed frontend workflow
-    # Automatic mode: the source workflow must have failed on feature/*.
-    # Manual mode: run the trusted diagnostic workflow from the default branch;
-    # the Python controller separately verifies that the supplied run ID belongs
-    # to a failed feature/* run of the expected frontend workflow.
+    # The workflow_run filter limits automatic events to feature/* branches.
+    # Manual dispatch must be started from the repository's default branch.
     if: >-
       (github.event_name == 'workflow_run' &&
        github.event.workflow_run.conclusion == 'failure' &&
@@ -47,9 +41,6 @@ jobs:
       actions: read
       contents: read
     steps:
-      # Always checkout trusted controller code from the default branch. In
-      # workflow_run this is the event context; in manual mode we require the
-      # default branch as the selected workflow ref as well.
       - name: Checkout trusted controller from default branch
         uses: actions/checkout@v7
         with:
@@ -67,62 +58,43 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install .
 
-      - name: Resolve target workflow run
+      - name: Resolve target workflow run ID
         id: target
         env:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
           INPUT_RUN_ID: ${{ inputs.run_id }}
-          EVENT_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
-          INPUT_RUN_ATTEMPT: ${{ inputs.run_attempt }}
         shell: bash
         run: |
           set -euo pipefail
+
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
             target_run_id="$EVENT_RUN_ID"
-            target_attempt="$EVENT_RUN_ATTEMPT"
           else
             target_run_id="$INPUT_RUN_ID"
-            target_attempt="$INPUT_RUN_ATTEMPT"
           fi
 
           if [[ ! "$target_run_id" =~ ^[0-9]+$ ]]; then
             echo "Invalid or missing workflow run ID." >&2
             exit 2
           fi
-          if [[ -n "$target_attempt" && ! "$target_attempt" =~ ^[0-9]+$ ]]; then
-            echo "Run attempt must be a positive integer." >&2
-            exit 2
-          fi
-          if [[ -n "$target_attempt" && "$target_attempt" -lt 1 ]]; then
-            echo "Run attempt must be greater than zero." >&2
-            exit 2
-          fi
 
           echo "run_id=$target_run_id" >> "$GITHUB_OUTPUT"
-          echo "run_attempt=$target_attempt" >> "$GITHUB_OUTPUT"
 
       - name: Diagnose failed feature-branch run
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ steps.target.outputs.run_id }}
-          RUN_ATTEMPT: ${{ steps.target.outputs.run_attempt }}
         shell: bash
         run: |
           set -euo pipefail
-          args=(
-            -m cicd_recovery.cli diagnose
-            --repo "$REPOSITORY"
-            --run-id "$RUN_ID"
-            --require-feature-branch
-            --require-failure
-            --expected-workflow-name "Frontend CI - Failure Scenarios"
-          )
-          if [[ -n "$RUN_ATTEMPT" ]]; then
-            args+=(--run-attempt "$RUN_ATTEMPT")
-          fi
-          python "${args[@]}"
+          python -m cicd_recovery.cli diagnose \
+            --repo "$REPOSITORY" \
+            --run-id "$RUN_ID" \
+            --require-feature-branch \
+            --require-failure \
+            --expected-workflow-name "Frontend CI"
 
       - name: Upload sanitized diagnosis report
         if: ${{ always() }}
