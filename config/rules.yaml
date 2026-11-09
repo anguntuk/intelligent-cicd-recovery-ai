@@ -1,0 +1,177 @@
+version: 1
+rules:
+  - id: npm_registry_timeout
+    category: dependency_network_transient
+    title: npm registry/network timeout
+    priority: 100
+    patterns:
+      - '(?i)\bETIMEDOUT\b'
+      - '(?i)\bECONNRESET\b'
+      - '(?i)\bEAI_AGAIN\b'
+      - '(?i)\bECONNREFUSED\b'
+      - '(?i)\bsocket hang up\b'
+      - '(?i)network request.*failed'
+    recommendation: >-
+      Check runner connectivity, DNS, proxy and npm registry health. A single bounded retry may
+      be considered only after the job is explicitly allowlisted and confirmed to be side-effect-free.
+    retry_candidate: true
+
+  - id: npm_registry_auth
+    category: dependency_registry_authentication
+    title: npm registry authentication/authorization failure
+    priority: 95
+    patterns:
+      - '(?i)\bENEEDAUTH\b'
+      - '(?i)\bE401\b'
+      - '(?i)\bE403\b'
+      - '(?i)\b401 Unauthorized\b'
+      - '(?i)\b403 Forbidden\b'
+      - '(?i)authentication.*required.*registry'
+    recommendation: >-
+      Verify the registry URL, package scope, token availability and token permissions. Do not print,
+      replace or broaden credentials automatically.
+    retry_candidate: false
+
+  - id: npm_lockfile_mismatch
+    category: dependency_lockfile_mismatch
+    title: package manifest and lockfile are inconsistent
+    priority: 94
+    patterns:
+      - '(?i)npm ci can only install packages when your package\.json and package-lock\.json.*in sync'
+      - '(?i)package\.json and package-lock\.json.*not in sync'
+      - '(?i)Missing: .+ from lock file'
+    recommendation: >-
+      Reconcile package.json and package-lock.json using the repository's approved package-manager
+      version, review the lockfile diff, and commit both files together.
+    retry_candidate: false
+
+  - id: npm_dependency_resolution
+    category: dependency_resolution_conflict
+    title: npm dependency resolution conflict
+    priority: 93
+    patterns:
+      - '(?i)\bERESOLVE\b'
+      - '(?i)unable to resolve dependency tree'
+      - '(?i)could not resolve dependency'
+      - '(?i)conflicting peer dependency'
+    recommendation: >-
+      Review incompatible package and peer-dependency versions. Do not bypass the conflict with
+      force/legacy-peer-deps automatically.
+    retry_candidate: false
+
+  - id: typescript_compile_error
+    category: typescript_compilation_failure
+    title: TypeScript compilation/type-check failure
+    priority: 90
+    patterns:
+      - '\bTS[0-9]{4}\b'
+      - '(?i)Type error:'
+      - '(?i)typecheck failed'
+      - '(?i)Found [0-9]+ errors? in [0-9]+ files?'
+    recommendation: >-
+      Inspect the reported file, line and TypeScript diagnostic. Treat this as a code/configuration
+      issue; do not retry automatically.
+    retry_candidate: false
+
+  - id: lint_failure
+    category: lint_or_static_quality_failure
+    title: frontend lint/static-quality failure
+    priority: 88
+    patterns:
+      - '(?i)ESLint.*(error|problem)'
+      - '(?i)\berror\s+.*\.(js|jsx|ts|tsx|vue)'
+      - '(?i)problems? \(.*errors?'
+      - '(?i)lint.*failed'
+    recommendation: >-
+      Review the linter output and fix the reported source violations. Do not suppress rules or
+      change quality gates automatically.
+    retry_candidate: false
+
+  - id: unit_test_failure
+    category: unit_test_failure
+    title: unit test assertion/failure
+    priority: 87
+    patterns:
+      - '(?i)AssertionError'
+      - '(?i)Test Suites:.*failed'
+      - '(?i)Tests:.*failed'
+      - '(?i)not ok [0-9]+'
+      - '(?i)expected .+ to (equal|be|contain)'
+    recommendation: >-
+      Identify the failing test and assertion. Preserve the initial failure; investigate test data,
+      code changes and possible flakiness before considering a separately approved test rerun.
+    retry_candidate: false
+
+  - id: frontend_build_failure
+    category: frontend_build_failure
+    title: frontend bundling/build failure
+    priority: 85
+    patterns:
+      - '(?i)Module not found: Error: Can.t resolve'
+      - '(?i)Could not resolve .* from'
+      - '(?i)Rollup failed to resolve import'
+      - '(?i)vite.*\b(error|failed)\b'
+      - '(?i)webpack.*\b(error|failed)\b'
+      - '(?i)BUILD_FAILURE_INJECTED'
+    recommendation: >-
+      Inspect missing imports, bundler configuration, environment variables and build diagnostics.
+      Do not modify source files automatically.
+    retry_candidate: false
+
+  - id: javascript_heap_exhaustion
+    category: runner_resource_exhaustion
+    title: Node.js heap/resource exhaustion
+    priority: 92
+    patterns:
+      - '(?i)JavaScript heap out of memory'
+      - '(?i)Ineffective mark-compacts near heap limit'
+      - '(?i)Allocation failed - JavaScript heap'
+      - '(?i)\bENOMEM\b'
+      - '(?i)out of memory'
+    recommendation: >-
+      Inspect runner memory limits, build size, parallelism and Node.js heap usage. Do not increase
+      resource limits automatically without an owner-approved change.
+    retry_candidate: false
+
+  - id: security_gate_failure
+    category: security_quality_gate_failure
+    title: dependency/security policy gate failure
+    priority: 98
+    patterns:
+      - '(?i)SECURITY_GATE_FAILURE'
+      - '(?i)npm audit.*(failed|vulnerabilit)'
+      - '(?i)(critical|high) vulnerabilities? found'
+      - '(?i)policy violation.*(security|vulnerabilit)'
+    recommendation: >-
+      Review the finding, affected dependency and approved remediation path. Never bypass or suppress
+      the security gate as an automated recovery action.
+    retry_candidate: false
+
+  - id: runner_infrastructure_failure
+    category: runner_infrastructure_failure
+    title: GitHub Actions runner interruption/infrastructure failure
+    priority: 80
+    patterns:
+      - '(?i)The hosted runner lost communication with the server'
+      - '(?i)The runner has received a shutdown signal'
+      - '(?i)Runner.*lost communication'
+      - '(?i)The operation was canceled'
+      - '(?i)job was cancelled'
+    recommendation: >-
+      Check job conclusion, runner status and whether the interrupted job is safe to repeat. A rerun
+      is not automatic in this prototype.
+    retry_candidate: true
+
+  - id: artifact_transfer_failure
+    category: artifact_transfer_failure
+    title: workflow artifact upload/download failure
+    priority: 78
+    patterns:
+      - '(?i)Artifact storage quota has been hit'
+      - '(?i)Failed to CreateArtifact'
+      - '(?i)upload-artifact.*(failed|error)'
+      - '(?i)download-artifact.*(failed|error)'
+    recommendation: >-
+      Check artifact size, retention/quota, artifact naming and transfer service status. Retrying is
+      only appropriate after confirming the underlying cause and job safety.
+    retry_candidate: false

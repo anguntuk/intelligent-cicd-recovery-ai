@@ -1,0 +1,2 @@
+AssertionError: expected 'ready' to equal 'done'
+Tests: 1 failed, 12 passed

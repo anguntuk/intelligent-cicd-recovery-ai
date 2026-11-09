@@ -1,0 +1,2 @@
+ESLint found problems: 2 errors and 0 warnings
+error src/App.jsx: Unexpected any. (@typescript-eslint/no-explicit-any)

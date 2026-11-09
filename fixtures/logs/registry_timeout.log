@@ -1,0 +1,2 @@
+npm error code ETIMEDOUT
+network request to https://registry.npmjs.org/example failed, reason: connect ETIMEDOUT

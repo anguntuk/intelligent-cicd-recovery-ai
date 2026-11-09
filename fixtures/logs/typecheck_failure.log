@@ -1,0 +1,2 @@
+src/App.tsx(18,7): error TS2322: Type 'string' is not assignable to type 'number'.
+Found 1 error in 1 file.

@@ -1,0 +1,107 @@
+# Intelligent CI/CD Failure Recovery — Separate GitHub workflows (v0.3, no AI)
+
+This prototype has two independent GitHub Actions workflows:
+
+1. **Application workflow** — `.github/workflows/frontend-ci.yml` runs the Node.js frontend CI only. It does not invoke Python or perform diagnosis.
+2. **Diagnostic workflow** — `.github/workflows/debug-frontend.yml` runs the Python controller as a separate workflow. It is triggered automatically after a failed frontend workflow on `feature/*`, or manually from the trusted default branch to analyze a supplied failed run ID from `feature/*`.
+
+Automatic diagnostics are triggered only for failed frontend runs whose source branch matches `feature/*`; `main` is excluded by the event branch filter. Manual dispatch is intentionally started from the protected default branch (`main`); the controller only accepts a target frontend run from `feature/*`. The Python controller independently verifies the target branch, failure conclusion, and expected frontend workflow name.
+
+**No local watcher is used.** VS Code is only the development environment. Both workflows and the Python controller execute on GitHub-hosted runners.
+
+**AI and recovery are disabled.** The controller reads workflow metadata and logs, redacts common credential patterns, applies deterministic rules, publishes a job summary and uploads a JSON report. It does not rerun jobs, change files, deploy, or modify GitHub.
+
+## Repository structure
+
+- `.github/workflows/frontend-ci.yml` — Node.js application CI only.
+- `.github/workflows/debug-frontend.yml` — separate automatic/manual diagnostic workflow.
+- `frontend/` — small dependency-free frontend demo and controlled failure scenarios.
+- `src/cicd_recovery/` — Python controller, GitHub REST API adapter, log redaction and rules engine.
+- `config/rules.yaml` — initial deterministic frontend failure signatures.
+- `fixtures/logs/` — offline sample log fixtures.
+- `tests/` — Python unit tests, including feature-branch and failure-conclusion validation.
+
+## Trigger behavior
+
+### Application workflow
+
+`Frontend CI - Failure Scenarios` runs on relevant pushes and can also be dispatched manually. It is independent of the debug workflow. It can run on `main` and feature branches.
+
+### Automatic diagnostic workflow
+
+`Frontend Failure Diagnostics` listens for `workflow_run` completion events from `Frontend CI - Failure Scenarios`, filtered to branches matching `feature/*`. GitHub can create a diagnostic workflow-run entry for every completed feature-branch run, but the `diagnose` job executes only when the frontend run's conclusion is `failure`; on a successful feature run, that job is skipped. No automatic diagnostic workflow is triggered for `main`.
+
+### Manual diagnostic workflow
+
+1. Open the repository's **Actions** tab.
+2. Select **Frontend Failure Diagnostics**.
+3. Click **Run workflow**.
+4. Select `main` (the default branch) in the branch selector. This runs the trusted diagnostic workflow definition from the protected default branch.
+5. Enter the failed frontend workflow run ID from a `feature/*` branch. Optionally enter a run attempt; leave it blank to analyze the latest attempt.
+6. Start the workflow.
+
+Manual dispatch requires write access and the workflow file must exist on the repository's default branch. The job only proceeds when the selected workflow ref is the default branch. The Python controller then independently validates that the supplied run belongs to `feature/*`, has a failed attempt, and belongs to `Frontend CI - Failure Scenarios`. Thus, manually starting the diagnostic workflow from `main` does not analyze a frontend run originating from `main`.
+
+The pattern `feature/*` is deliberately interpreted as one branch segment, e.g. `feature/login`. Nested branches such as `feature/team/login` are not included. Adjust both the YAML branch filter and Python validator if you later want nested feature branch names.
+
+## Why the diagnostic workflow checks out the default branch
+
+GitHub's `workflow_run` event executes in the default-branch context. The diagnostic workflow explicitly checks out the repository's default branch to obtain trusted controller code and rules. It does not check out the originating feature branch or download artifacts from that run. This avoids executing untrusted feature-branch code with the diagnostic workflow's token. The workflow has only `actions: read` and `contents: read` permissions.
+
+For `workflow_run` to trigger, `debug-frontend.yml` must exist on the repository's default branch. Raise a PR to merge `.github/workflows/debug-frontend.yml`, the Python controller, and its rules into `main`; after that merge, GitHub can deliver automatic `workflow_run` events and expose the manual-dispatch control.
+
+## Run offline tests locally (optional)
+
+The local tests are optional development checks; production diagnosis runs inside GitHub Actions. Python 3.11+ is needed only if you want to run the Python tests locally.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e '.[dev]'
+pytest
+```
+
+## Push to GitHub
+
+Ensure both workflow files are committed to the default branch. Then create a feature branch and push it:
+
+```bash
+git switch -c feature/diagnosis-demo
+git add .
+git commit -m "Separate frontend CI and failure diagnostics workflows"
+git push -u origin feature/diagnosis-demo
+```
+
+The application workflow runs on the feature branch. If it fails, the separate diagnostic workflow is triggered automatically.
+
+## Controlled scenarios
+
+The application workflow's manual dispatch input supports: `success`, `registry_timeout`, `registry_auth`, `dependency_conflict`, `lint_failure`, `typecheck_failure`, `unit_test_failure`, `build_failure`, `out_of_memory`, `security_gate_failure`, and `unknown_failure`. Select a `feature/*` branch for testing automatic diagnostics.
+
+## Expected results
+
+- The application workflow has only the Node.js frontend job.
+- A failure on `feature/*` produces a second, independent workflow run named **Frontend Failure Diagnostics**.
+- A successful feature-branch application run can create a diagnostic workflow-run entry, but its `diagnose` job is skipped. GitHub's `workflow_run` event filters by branch and completion type, not by conclusion.
+- An application failure on `main` does not start the diagnostic workflow.
+- Manual diagnosis proceeds only when the selected branch is `feature/*` and the supplied run ID belongs to the expected frontend workflow on a failed feature branch. The selected run attempt is recorded explicitly.
+- Diagnosis creates a JSON artifact and GitHub Actions job summary.
+- The application workflow's original failure remains failed; diagnostic success does not change that result.
+
+## Known limitations
+
+- This is a generic Node.js demo, not yet the client's real React/Angular/Vue codebase.
+- The failure scenarios are controlled log injections after baseline stages, not real service outages or real vulnerability findings.
+- The sample TypeScript check is a source-contract placeholder, not a full TypeScript compiler invocation.
+- Rules can produce false positives and false negatives.
+- Secret redaction is best-effort; do not assume it catches every client-specific secret format.
+- Only failed/timed-out/cancelled jobs and bounded log downloads are analyzed.
+- No Copilot/LLM, automatic recovery or GitHub write operation is included.
+
+## Security notes
+
+- Use only `actions: read` and `contents: read` for the diagnostic workflow.
+- Do not download or execute artifacts from the frontend workflow.
+- Do not check out feature-branch source code in the privileged diagnostic workflow.
+- Keep the diagnostic workflow on the default branch and require review for changes.
+- The manual trigger requires repository write access. Restrict that permission to trusted maintainers.

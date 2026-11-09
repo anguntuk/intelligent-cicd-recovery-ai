@@ -1,0 +1,142 @@
+name: Frontend CI - Failure Scenarios
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: Select a controlled failure scenario for diagnosis
+        required: true
+        default: success
+        type: choice
+        options:
+          - success
+          - registry_timeout
+          - registry_auth
+          - dependency_conflict
+          - lint_failure
+          - typecheck_failure
+          - unit_test_failure
+          - build_failure
+          - out_of_memory
+          - security_gate_failure
+          - unknown_failure
+  push:
+    paths:
+      - 'frontend/**'
+      - '.github/workflows/frontend-ci.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  frontend-ci:
+    name: Node.js frontend CI
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          package-manager-cache: false
+
+      - name: Show runtime versions
+        run: |
+          node --version
+          npm --version
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Simulate npm registry timeout
+        if: ${{ inputs.scenario == 'registry_timeout' }}
+        run: |
+          echo "npm error code ETIMEDOUT"
+          echo "network request to https://registry.npmjs.org/example failed, reason: connect ETIMEDOUT"
+          exit 1
+
+      - name: Simulate npm registry authentication failure
+        if: ${{ inputs.scenario == 'registry_auth' }}
+        run: |
+          echo "npm error code E401"
+          echo "401 Unauthorized - authentication required for registry package"
+          exit 1
+
+      - name: Simulate dependency resolution conflict
+        if: ${{ inputs.scenario == 'dependency_conflict' }}
+        run: |
+          echo "npm error code ERESOLVE"
+          echo "npm error ERESOLVE unable to resolve dependency tree"
+          echo "npm error Conflicting peer dependency: example-package@2.0.0"
+          exit 1
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Simulate lint failure
+        if: ${{ inputs.scenario == 'lint_failure' }}
+        run: |
+          echo "ESLint found problems: 2 errors and 0 warnings"
+          echo "error src/App.jsx: Unexpected any. (@typescript-eslint/no-explicit-any)"
+          exit 1
+
+      - name: Type-check frontend
+        run: npm run typecheck
+
+      - name: Simulate TypeScript compilation failure
+        if: ${{ inputs.scenario == 'typecheck_failure' }}
+        run: |
+          echo "src/App.tsx(18,7): error TS2322: Type 'string' is not assignable to type 'number'."
+          echo "Found 1 error in 1 file."
+          exit 1
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Simulate unit test assertion failure
+        if: ${{ inputs.scenario == 'unit_test_failure' }}
+        run: |
+          echo "AssertionError: expected 'ready' to equal 'done'"
+          echo "Tests: 1 failed, 12 passed"
+          exit 1
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Simulate frontend build failure
+        if: ${{ inputs.scenario == 'build_failure' }}
+        run: |
+          echo "BUILD_FAILURE_INJECTED: Rollup failed to resolve import ./missing-module"
+          exit 1
+
+      - name: Simulate Node.js heap exhaustion
+        if: ${{ inputs.scenario == 'out_of_memory' }}
+        run: |
+          echo "FATAL ERROR: Ineffective mark-compacts near heap limit Allocation failed - JavaScript heap out of memory"
+          exit 1
+
+      - name: Simulate security gate failure
+        if: ${{ inputs.scenario == 'security_gate_failure' }}
+        run: |
+          echo "SECURITY_GATE_FAILURE: 1 critical vulnerability found in a direct dependency"
+          exit 1
+
+      - name: Simulate an unknown failure
+        if: ${{ inputs.scenario == 'unknown_failure' }}
+        run: |
+          echo "DEMO_UNCLASSIFIED_ERROR: upstream compilation orchestrator returned state ZQ-418"
+          exit 1
+
+      - name: Upload frontend build
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          if-no-files-found: error
+          retention-days: 3
