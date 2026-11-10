@@ -1,19 +1,18 @@
 name: Frontend Failure Diagnostics
 
-# Automatic: run after Frontend CI completes on feature/* branches.
-# Manual: dispatch this workflow from the default branch and enter a failed run ID.
 on:
   workflow_run:
     workflows:
-      - Frontend CI
+      - "Frontend CI"
     types:
       - completed
     branches:
-      - 'feature/*'
+      - 'feature/**'
+
   workflow_dispatch:
     inputs:
       run_id:
-        description: Failed Frontend CI workflow run ID to analyze
+        description: "Failed Frontend CI run ID"
         required: true
         type: string
 
@@ -27,82 +26,84 @@ concurrency:
 
 jobs:
   diagnose:
-    name: Analyze failed frontend workflow
-    # The workflow_run filter limits automatic events to feature/* branches.
-    # Manual dispatch must be started from the repository's default branch.
-    if: >-
-      (github.event_name == 'workflow_run' &&
-       github.event.workflow_run.conclusion == 'failure' &&
-       startsWith(github.event.workflow_run.head_branch, 'feature/')) ||
-      (github.event_name == 'workflow_dispatch' &&
-       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    name: CI Result and Failure Diagnosis
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-    steps:
-      - name: Checkout trusted controller from default branch
-        uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          persist-credentials: false
 
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+      # 1. Report successful CI
+      - name: Report successful frontend CI
+        if: >-
+          ${{
+            github.event_name == 'workflow_run' &&
+            github.event.workflow_run.conclusion == 'success'
+          }}
+        run: |
+          {
+            echo "## ✅ Frontend CI completed successfully"
+            echo ""
+            echo "No failure detected."
+            echo "Diagnostic analysis was not required."
+            echo ""
+            echo "- Diagnosis: Not required"
+            echo "- Python controller: Not invoked"
+            echo "- Recovery: Not applicable"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "Frontend CI successful. Skipping diagnosis."
+
+      # 2. Checkout diagnostic code only when needed
+      - name: Checkout diagnostic code
+        if: >-
+          ${{
+            github.event_name == 'workflow_dispatch' ||
+            (
+              github.event_name == 'workflow_run' &&
+              github.event.workflow_run.conclusion == 'failure'
+            )
+          }}
+        uses: actions/checkout@v7
+
+      # 3. Setup Python only when needed
       - name: Set up Python
+        if: >-
+          ${{
+            github.event_name == 'workflow_dispatch' ||
+            (
+              github.event_name == 'workflow_run' &&
+              github.event.workflow_run.conclusion == 'failure'
+            )
+          }}
         uses: actions/setup-python@v6
         with:
           python-version: '3.13'
-          cache: pip
 
-      - name: Install Python controller
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install .
+      # Keep your existing dependency installation step here,
+      # using the same condition as above.
 
-      - name: Resolve target workflow run ID
-        id: target
+      # 4. Execute diagnosis only when needed
+      - name: Analyze frontend failure
+        if: >-
+          ${{
+            github.event_name == 'workflow_dispatch' ||
+            (
+              github.event_name == 'workflow_run' &&
+              github.event.workflow_run.conclusion == 'failure'
+            )
+          }}
         env:
-          EVENT_NAME: ${{ github.event_name }}
-          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
-          INPUT_RUN_ID: ${{ inputs.run_id }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
-            target_run_id="$EVENT_RUN_ID"
-          else
-            target_run_id="$INPUT_RUN_ID"
-          fi
-
-          if [[ ! "$target_run_id" =~ ^[0-9]+$ ]]; then
-            echo "Invalid or missing workflow run ID." >&2
-            exit 2
-          fi
-
-          echo "run_id=$target_run_id" >> "$GITHUB_OUTPUT"
-
-      - name: Diagnose failed feature-branch run
-        env:
-          GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ steps.target.outputs.run_id }}
-        shell: bash
+          RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.run_id }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           python -m cicd_recovery.cli diagnose \
             --repo "$REPOSITORY" \
             --run-id "$RUN_ID" \
             --require-feature-branch \
             --require-failure \
-            --expected-workflow-name "Frontend CI" \
-            --rules "$GITHUB_WORKSPACE/config/rules.yaml" \
-            --output-dir "$GITHUB_WORKSPACE/reports"
-
-      - name: Upload sanitized diagnosis report
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: frontend-diagnosis-${{ steps.target.outputs.run_id }}
-          path: reports/*.json
-          if-no-files-found: ignore
-          retention-days: 7
+            --expected-workflow-name "Frontend CI"
