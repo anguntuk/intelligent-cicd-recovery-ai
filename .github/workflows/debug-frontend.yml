@@ -1,24 +1,28 @@
+
 name: Frontend Failure Diagnostics
 
 on:
+  # Automatically trigger after Frontend CI completes
+  # on a feature/* branch, regardless of its conclusion.
   workflow_run:
     workflows:
       - "Frontend CI"
     types:
       - completed
     branches:
-      - 'feature/**'
+      - 'feature/*'
 
+  # Allow manually analyzing a specific frontend run.
   workflow_dispatch:
     inputs:
       run_id:
-        description: "Failed Frontend CI run ID"
+        description: "Frontend CI workflow run ID to analyze"
         required: true
         type: string
 
 permissions:
-  actions: read
   contents: read
+  actions: read
 
 concurrency:
   group: frontend-diagnostics-${{ github.event.workflow_run.id || inputs.run_id || github.run_id }}
@@ -26,7 +30,7 @@ concurrency:
 
 jobs:
   diagnose:
-    name: CI Result and Failure Diagnosis
+    name: Frontend CI Result and Failure Diagnosis
     runs-on: ubuntu-latest
 
     permissions:
@@ -34,76 +38,202 @@ jobs:
       actions: read
 
     steps:
-      # 1. Report successful CI
-      - name: Report successful frontend CI
-        if: >-
-          ${{
-            github.event_name == 'workflow_run' &&
-            github.event.workflow_run.conclusion == 'success'
-          }}
-        run: |
-          {
-            echo "## ✅ Frontend CI completed successfully"
-            echo ""
-            echo "No failure detected."
-            echo "Diagnostic analysis was not required."
-            echo ""
-            echo "- Diagnosis: Not required"
-            echo "- Python controller: Not invoked"
-            echo "- Recovery: Not applicable"
-          } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "Frontend CI successful. Skipping diagnosis."
-
-      # 2. Checkout diagnostic code only when needed
-      - name: Checkout diagnostic code
-        if: >-
-          ${{
-            github.event_name == 'workflow_dispatch' ||
-            (
-              github.event_name == 'workflow_run' &&
-              github.event.workflow_run.conclusion == 'failure'
-            )
-          }}
-        uses: actions/checkout@v7
-
-      # 3. Setup Python only when needed
-      - name: Set up Python
-        if: >-
-          ${{
-            github.event_name == 'workflow_dispatch' ||
-            (
-              github.event_name == 'workflow_run' &&
-              github.event.workflow_run.conclusion == 'failure'
-            )
-          }}
-        uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-
-      # Keep your existing dependency installation step here,
-      # using the same condition as above.
-
-      # 4. Execute diagnosis only when needed
-      - name: Analyze frontend failure
-        if: >-
-          ${{
-            github.event_name == 'workflow_dispatch' ||
-            (
-              github.event_name == 'workflow_run' &&
-              github.event.workflow_run.conclusion == 'failure'
-            )
-          }}
+      # ==================================================
+      # STEP 1: GATE - Validate the target Frontend CI run
+      # ==================================================
+      - name: Check frontend CI result
+        id: gate
+        shell: bash
         env:
-          REPOSITORY: ${{ github.repository }}
-          RUN_ID: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.id || inputs.run_id }}
           GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
         run: |
           set -euo pipefail
+
+          echo "Checking target Frontend CI execution..."
+
+          # Identify target run based on trigger type.
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            TARGET_RUN_ID="$EVENT_RUN_ID"
+          else
+            TARGET_RUN_ID="$INPUT_RUN_ID"
+          fi
+
+          # Validate run ID.
+          if [[ ! "$TARGET_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "::error::Invalid or missing workflow run ID."
+            exit 1
+          fi
+
+          echo "Target Run ID: $TARGET_RUN_ID"
+
+          # Retrieve actual workflow run details.
+          RUN_DATA=$(gh api \
+            "repos/${REPOSITORY}/actions/runs/${TARGET_RUN_ID}")
+
+          WORKFLOW_NAME=$(jq -r '.name // ""' <<< "$RUN_DATA")
+          BRANCH=$(jq -r '.head_branch // ""' <<< "$RUN_DATA")
+          CONCLUSION=$(jq -r '.conclusion // ""' <<< "$RUN_DATA")
+          STATUS=$(jq -r '.status // ""' <<< "$RUN_DATA")
+
+          RUN_URL=$(jq -r '.html_url // ""' <<< "$RUN_DATA")
+
+          echo "Workflow   : $WORKFLOW_NAME"
+          echo "Branch     : $BRANCH"
+          echo "Status     : $STATUS"
+          echo "Conclusion : $CONCLUSION"
+
+          # Validate workflow name.
+          if [[ "$WORKFLOW_NAME" != "Frontend CI" ]]; then
+            echo "::error::Expected Frontend CI workflow."
+            exit 1
+          fi
+
+          # Validate source branch.
+          if [[ ! "$BRANCH" =~ ^feature/[^/]+$ ]]; then
+            echo "::error::Only feature/* branches are allowed."
+            exit 1
+          fi
+
+          # Only analyze completed runs.
+          if [[ "$STATUS" != "completed" ]]; then
+            echo "::error::Target workflow has not completed."
+            exit 1
+          fi
+
+          # Default: diagnosis is not required.
+          echo "should_diagnose=false" >> "$GITHUB_OUTPUT"
+          echo "run_id=$TARGET_RUN_ID" >> "$GITHUB_OUTPUT"
+
+          # ==========================================
+          # DECISION 1: Frontend CI SUCCESS
+          # ==========================================
+          if [[ "$CONCLUSION" == "success" ]]; then
+
+            echo "Frontend CI completed successfully."
+            echo "No diagnostic analysis is required."
+
+            {
+              echo "## ✅ Frontend CI completed successfully"
+              echo ""
+              echo "No failure detected. Diagnostic analysis was not required."
+              echo ""
+              echo "- **Branch:** $BRANCH"
+              echo "- **Run ID:** [$TARGET_RUN_ID]($RUN_URL)"
+              echo "- **Diagnosis:** Not required"
+              echo "- **Python controller:** Not invoked"
+              echo "- **Recovery:** Not applicable"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+          # ==========================================
+          # DECISION 2: Frontend CI FAILURE
+          # ==========================================
+          elif [[ "$CONCLUSION" == "failure" ]]; then
+
+            echo "should_diagnose=true" >> "$GITHUB_OUTPUT"
+
+            echo "Frontend CI failure detected."
+            echo "Starting diagnostic analysis."
+
+            {
+              echo "## ❌ Frontend CI failure detected"
+              echo ""
+              echo "Starting automated failure diagnosis."
+              echo ""
+              echo "- **Branch:** $BRANCH"
+              echo "- **Run ID:** [$TARGET_RUN_ID]($RUN_URL)"
+              echo "- **Diagnosis:** In progress"
+              echo "- **AI:** Disabled"
+              echo "- **Recovery:** Disabled"
+            } >> "$GITHUB_STEP_SUMMARY"
+
+          # ==========================================
+          # DECISION 3: OTHER CONCLUSIONS
+          # ==========================================
+          else
+
+            echo "No failure diagnosis will be performed."
+            echo "Frontend CI conclusion: $CONCLUSION"
+
+            {
+              echo "## ℹ️ Diagnosis not required"
+              echo ""
+              echo "Frontend CI completed with conclusion: **$CONCLUSION**"
+              echo ""
+              echo "No diagnostic analysis was initiated."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+          fi
+
+      # ==================================================
+      # STEP 2: CHECKOUT TRUSTED CONTROLLER
+      # ==================================================
+      - name: Checkout diagnostic code
+        if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      # ==================================================
+      # STEP 3: SETUP PYTHON
+      # ==================================================
+      - name: Set up Python
+        if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # ==================================================
+      # STEP 4: INSTALL PYTHON CONTROLLER
+      # ==================================================
+      - name: Install Python dependencies
+        if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      # ==================================================
+      # STEP 5: ANALYZE FRONTEND FAILURE
+      # ==================================================
+      - name: Analyze failed frontend workflow
+        if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ steps.gate.outputs.run_id }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$GITHUB_WORKSPACE/reports"
 
           python -m cicd_recovery.cli diagnose \
             --repo "$REPOSITORY" \
             --run-id "$RUN_ID" \
             --require-feature-branch \
             --require-failure \
-            --expected-workflow-name "Frontend CI"
+            --expected-workflow-name "Frontend CI" \
+            --rules "$GITHUB_WORKSPACE/config/rules.yaml" \
+            --output-dir "$GITHUB_WORKSPACE/reports"
+
+      # ==================================================
+      # STEP 6: UPLOAD DIAGNOSIS REPORT
+      # ==================================================
+      - name: Upload diagnosis report
+        if: ${{ always() && steps.gate.outputs.should_diagnose == 'true' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: frontend-diagnosis-${{ steps.gate.outputs.run_id }}
+          path: reports/*.json
+          if-no-files-found: ignore
+          retention-days: 7
