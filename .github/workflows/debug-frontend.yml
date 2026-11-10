@@ -10,7 +10,7 @@ on:
     types:
       - completed
     branches:
-      - 'feature/*'
+      - 'feature/**'
 
   # Allow manually analyzing a specific frontend run.
   workflow_dispatch:
