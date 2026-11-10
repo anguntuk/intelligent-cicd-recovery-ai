@@ -15,7 +15,29 @@ from cicd_recovery.github_api import GitHubActionsClient, GitHubApiError
 from cicd_recovery.redaction import redact_text
 from cicd_recovery.rules import load_rules, match_rules
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+def find_project_root(start: Path | None = None) -> Path:
+    """Locate the repository root from the current working directory."""
+
+    current = (start or Path.cwd()).resolve()
+
+    if current.is_file():
+        current = current.parent
+
+    for candidate in (current, *current.parents):
+        if (
+            (candidate / "pyproject.toml").is_file()
+            and (candidate / "config" / "rules.yaml").is_file()
+        ):
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not locate project root containing "
+        "pyproject.toml and config/rules.yaml"
+    )
+
+
+PROJECT_ROOT = find_project_root()
+
 DEFAULT_RULES = PROJECT_ROOT / "config" / "rules.yaml"
 DEFAULT_FIXTURES = PROJECT_ROOT / "fixtures" / "logs"
 
