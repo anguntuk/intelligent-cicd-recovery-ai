@@ -94,7 +94,9 @@ jobs:
             --run-id "$RUN_ID" \
             --require-feature-branch \
             --require-failure \
-            --expected-workflow-name "Frontend CI"
+            --expected-workflow-name "Frontend CI" \
+            --rules "$GITHUB_WORKSPACE/config/rules.yaml" \
+            --output-dir "$GITHUB_WORKSPACE/reports"
 
       - name: Upload sanitized diagnosis report
         if: ${{ always() }}
