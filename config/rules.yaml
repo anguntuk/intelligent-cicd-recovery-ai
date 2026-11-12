@@ -98,8 +98,14 @@ rules:
       - '(?i)not ok [0-9]+'
       - '(?i)expected .+ to (equal|be|contain)'
     recommendation: >-
-      Identify the failing test and assertion. Preserve the initial failure; investigate test data,
-      code changes and possible flakiness before considering a separately approved test rerun.
+      1. Open the failing test file and locate the assertion using the stack trace.
+      2. Compare the expected and actual values reported in the failure log.
+      3. Determine whether the application implementation or the test expectation/fixture is incorrect.
+      4. Correct the relevant implementation or test data without deleting, skipping or weakening the assertion.
+      5. Run npm test and npm run build to validate the correction.
+      
+      This deterministic assertion failure is not eligible for automatic retry.
+      No source-code modification or remediation is performed by this diagnostic controller.
     retry_candidate: false
 
   - id: frontend_build_failure

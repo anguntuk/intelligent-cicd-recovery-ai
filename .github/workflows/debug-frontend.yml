@@ -2,8 +2,8 @@
 name: Frontend Failure Diagnostics
 
 on:
-  # Automatically trigger after Frontend CI completes
-  # on a feature/* branch, regardless of its conclusion.
+  # Automatically trigger when Frontend CI completes
+  # on a feature branch, regardless of its conclusion.
   workflow_run:
     workflows:
       - "Frontend CI"
@@ -12,7 +12,7 @@ on:
     branches:
       - 'feature/**'
 
-  # Allow manually analyzing a specific frontend run.
+  # Manually analyze a specific Frontend CI execution.
   workflow_dispatch:
     inputs:
       run_id:
@@ -32,6 +32,7 @@ jobs:
   diagnose:
     name: Frontend CI Result and Failure Diagnosis
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     permissions:
       contents: read
@@ -40,7 +41,7 @@ jobs:
     steps:
 
       # ==================================================
-      # STEP 1: GATE - Validate the target Frontend CI run
+      # STEP 1: GATE - Identify and validate source run
       # ==================================================
       - name: Check frontend CI result
         id: gate
@@ -50,17 +51,23 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           EVENT_NAME: ${{ github.event_name }}
           EVENT_RUN_ID: ${{ github.event.workflow_run.id }}
+          EVENT_SOURCE_SHA: ${{ github.event.workflow_run.head_sha }}
+          EVENT_SOURCE_BRANCH: ${{ github.event.workflow_run.head_branch }}
           INPUT_RUN_ID: ${{ inputs.run_id }}
+
         run: |
           set -euo pipefail
 
           echo "Checking target Frontend CI execution..."
 
-          # Identify target run based on trigger type.
+          # Identify target run based on event type.
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
             TARGET_RUN_ID="$EVENT_RUN_ID"
-          else
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             TARGET_RUN_ID="$INPUT_RUN_ID"
+          else
+            echo "::error::Unsupported diagnostic event."
+            exit 1
           fi
 
           # Validate run ID.
@@ -79,13 +86,18 @@ jobs:
           BRANCH=$(jq -r '.head_branch // ""' <<< "$RUN_DATA")
           CONCLUSION=$(jq -r '.conclusion // ""' <<< "$RUN_DATA")
           STATUS=$(jq -r '.status // ""' <<< "$RUN_DATA")
-
+          SOURCE_SHA=$(jq -r '.head_sha // ""' <<< "$RUN_DATA")
+          HEAD_REPOSITORY=$(jq -r '.head_repository.full_name // ""' <<< "$RUN_DATA")
           RUN_URL=$(jq -r '.html_url // ""' <<< "$RUN_DATA")
 
-          echo "Workflow   : $WORKFLOW_NAME"
-          echo "Branch     : $BRANCH"
-          echo "Status     : $STATUS"
-          echo "Conclusion : $CONCLUSION"
+          echo "--------------------------------------"
+          echo "Workflow       : $WORKFLOW_NAME"
+          echo "Branch         : $BRANCH"
+          echo "Status         : $STATUS"
+          echo "Conclusion     : $CONCLUSION"
+          echo "Source SHA     : $SOURCE_SHA"
+          echo "Source Repo    : $HEAD_REPOSITORY"
+          echo "--------------------------------------"
 
           # Validate workflow name.
           if [[ "$WORKFLOW_NAME" != "Frontend CI" ]]; then
@@ -93,24 +105,57 @@ jobs:
             exit 1
           fi
 
+          # Reject external repository runs.
+          if [[ "$HEAD_REPOSITORY" != "$REPOSITORY" ]]; then
+            echo "::error::Runs from external repositories are not allowed."
+            exit 1
+          fi
+
           # Validate source branch.
-          if [[ ! "$BRANCH" =~ ^feature/[^/]+$ ]]; then
+          # Supports feature/login and feature/ui/header.
+          if [[ "$BRANCH" != feature/* ]]; then
             echo "::error::Only feature/* branches are allowed."
             exit 1
           fi
 
-          # Only analyze completed runs.
+          # Validate source commit SHA.
+          if [[ ! "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Invalid source commit SHA."
+            exit 1
+          fi
+
+          # Ensure the originating event and API identify
+          # the same commit and branch.
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+
+            if [[ "$SOURCE_SHA" != "$EVENT_SOURCE_SHA" ]]; then
+              echo "::error::Source SHA mismatch."
+              echo "Event SHA: $EVENT_SOURCE_SHA"
+              echo "API SHA:   $SOURCE_SHA"
+              exit 1
+            fi
+
+            if [[ "$BRANCH" != "$EVENT_SOURCE_BRANCH" ]]; then
+              echo "::error::Source branch mismatch."
+              exit 1
+            fi
+
+          fi
+
+          # Ensure source workflow has completed.
           if [[ "$STATUS" != "completed" ]]; then
             echo "::error::Target workflow has not completed."
             exit 1
           fi
 
-          # Default: diagnosis is not required.
+          # Set common outputs.
           echo "should_diagnose=false" >> "$GITHUB_OUTPUT"
           echo "run_id=$TARGET_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "source_branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
           # ==========================================
-          # DECISION 1: Frontend CI SUCCESS
+          # DECISION 1: FRONTEND CI SUCCESS
           # ==========================================
           if [[ "$CONCLUSION" == "success" ]]; then
 
@@ -120,17 +165,20 @@ jobs:
             {
               echo "## ✅ Frontend CI completed successfully"
               echo ""
-              echo "No failure detected. Diagnostic analysis was not required."
+              echo "No failures detected. Diagnostic analysis was not required."
               echo ""
+              echo "- **Repository:** $REPOSITORY"
               echo "- **Branch:** $BRANCH"
               echo "- **Run ID:** [$TARGET_RUN_ID]($RUN_URL)"
+              echo "- **Source SHA:** \`$SOURCE_SHA\`"
               echo "- **Diagnosis:** Not required"
               echo "- **Python controller:** Not invoked"
+              echo "- **AI:** Disabled"
               echo "- **Recovery:** Not applicable"
             } >> "$GITHUB_STEP_SUMMARY"
 
           # ==========================================
-          # DECISION 2: Frontend CI FAILURE
+          # DECISION 2: FRONTEND CI FAILURE
           # ==========================================
           elif [[ "$CONCLUSION" == "failure" ]]; then
 
@@ -144,8 +192,10 @@ jobs:
               echo ""
               echo "Starting automated failure diagnosis."
               echo ""
+              echo "- **Repository:** $REPOSITORY"
               echo "- **Branch:** $BRANCH"
               echo "- **Run ID:** [$TARGET_RUN_ID]($RUN_URL)"
+              echo "- **Source SHA:** \`$SOURCE_SHA\`"
               echo "- **Diagnosis:** In progress"
               echo "- **AI:** Disabled"
               echo "- **Recovery:** Disabled"
@@ -156,7 +206,7 @@ jobs:
           # ==========================================
           else
 
-            echo "No failure diagnosis will be performed."
+            echo "Diagnosis not required."
             echo "Frontend CI conclusion: $CONCLUSION"
 
             {
@@ -164,23 +214,60 @@ jobs:
               echo ""
               echo "Frontend CI completed with conclusion: **$CONCLUSION**"
               echo ""
-              echo "No diagnostic analysis was initiated."
+              echo "- **Branch:** $BRANCH"
+              echo "- **Source SHA:** \`$SOURCE_SHA\`"
+              echo "- **Diagnosis:** Not required"
             } >> "$GITHUB_STEP_SUMMARY"
 
           fi
 
       # ==================================================
-      # STEP 2: CHECKOUT TRUSTED CONTROLLER
+      # STEP 2: CHECKOUT CONTROLLER FROM SOURCE COMMIT
       # ==================================================
-      - name: Checkout diagnostic code
+      - name: Checkout diagnostic controller from source commit
+        id: checkout-controller
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
         uses: actions/checkout@v7
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          repository: ${{ github.repository }}
+          ref: ${{ steps.gate.outputs.source_sha }}
+          fetch-depth: 1
           persist-credentials: false
 
       # ==================================================
-      # STEP 3: SETUP PYTHON
+      # STEP 3: VERIFY CHECKED OUT COMMIT
+      # ==================================================
+      - name: Verify diagnostic controller commit
+        if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ steps.gate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+
+          ACTUAL_SHA=$(git rev-parse HEAD)
+
+          echo "Expected source SHA: $EXPECTED_SHA"
+          echo "Actual checkout SHA: $ACTUAL_SHA"
+
+          if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+            echo "::error::Controller checkout does not match source CI commit."
+            exit 1
+          fi
+
+          echo "Controller source commit verified successfully."
+
+          {
+            echo ""
+            echo "### Controller source verification"
+            echo ""
+            echo "- **Expected SHA:** \`$EXPECTED_SHA\`"
+            echo "- **Actual SHA:** \`$ACTUAL_SHA\`"
+            echo "- **Verification:** Passed"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ==================================================
+      # STEP 4: SETUP PYTHON
       # ==================================================
       - name: Set up Python
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
@@ -191,7 +278,7 @@ jobs:
           cache-dependency-path: pyproject.toml
 
       # ==================================================
-      # STEP 4: INSTALL PYTHON CONTROLLER
+      # STEP 5: INSTALL PYTHON CONTROLLER
       # ==================================================
       - name: Install Python dependencies
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
@@ -203,7 +290,7 @@ jobs:
           python -m pip install .
 
       # ==================================================
-      # STEP 5: ANALYZE FRONTEND FAILURE
+      # STEP 6: ANALYZE FRONTEND FAILURE
       # ==================================================
       - name: Analyze failed frontend workflow
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
@@ -217,6 +304,8 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/reports"
 
+          echo "Starting deterministic failure diagnosis..."
+
           python -m cicd_recovery.cli diagnose \
             --repo "$REPOSITORY" \
             --run-id "$RUN_ID" \
@@ -227,7 +316,7 @@ jobs:
             --output-dir "$GITHUB_WORKSPACE/reports"
 
       # ==================================================
-      # STEP 6: UPLOAD DIAGNOSIS REPORT
+      # STEP 7: UPLOAD DIAGNOSIS REPORT
       # ==================================================
       - name: Upload diagnosis report
         if: ${{ always() && steps.gate.outputs.should_diagnose == 'true' }}
