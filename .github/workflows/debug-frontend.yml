@@ -79,6 +79,7 @@ jobs:
           BRANCH=$(jq -r '.head_branch // ""' <<< "$RUN_DATA")
           CONCLUSION=$(jq -r '.conclusion // ""' <<< "$RUN_DATA")
           STATUS=$(jq -r '.status // ""' <<< "$RUN_DATA")
+          SOURCE_SHA=$(jq -r '.head_sha // ""' <<< "$RUN_DATA")
 
           RUN_URL=$(jq -r '.html_url // ""' <<< "$RUN_DATA")
 
@@ -86,6 +87,7 @@ jobs:
           echo "Branch     : $BRANCH"
           echo "Status     : $STATUS"
           echo "Conclusion : $CONCLUSION"
+          echo "Source SHA : $SOURCE_SHA"
 
           # Validate workflow name.
           if [[ "$WORKFLOW_NAME" != "Frontend CI" ]]; then
@@ -108,6 +110,8 @@ jobs:
           # Default: diagnosis is not required.
           echo "should_diagnose=false" >> "$GITHUB_OUTPUT"
           echo "run_id=$TARGET_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "source_branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
           # ==========================================
           # DECISION 1: Frontend CI SUCCESS
