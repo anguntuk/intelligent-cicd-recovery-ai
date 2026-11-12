@@ -103,6 +103,7 @@ rules:
       3. Determine whether the application implementation or the test expectation/fixture is incorrect.
       4. Correct the relevant implementation or test data without deleting, skipping or weakening the assertion.
       5. Run npm test and npm run build to validate the correction.
+      
       This deterministic assertion failure is not eligible for automatic retry.
       No source-code modification or remediation is performed by this diagnostic controller.
     retry_candidate: false
