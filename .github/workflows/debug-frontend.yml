@@ -2,8 +2,6 @@
 name: Frontend Failure Diagnostics
 
 on:
-  # Automatically trigger when Frontend CI completes
-  # on a feature branch, regardless of its conclusion.
   workflow_run:
     workflows:
       - "Frontend CI"
@@ -12,7 +10,6 @@ on:
     branches:
       - 'feature/**'
 
-  # Manually analyze a specific Frontend CI execution.
   workflow_dispatch:
     inputs:
       run_id:
@@ -29,10 +26,17 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+
+  # ==================================================
+  # JOB 1: DETERMINISTIC FAILURE DIAGNOSIS
+  # ==================================================
   diagnose:
     name: Frontend CI Result and Failure Diagnosis
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    outputs:
+      approval_required: ${{ steps.approval.outputs.required }}
 
     permissions:
       contents: read
@@ -40,9 +44,7 @@ jobs:
 
     steps:
 
-      # ==================================================
-      # STEP 1: GATE - Identify and validate source run
-      # ==================================================
+      # STEP 1: IDENTIFY AND VALIDATE SOURCE RUN
       - name: Check frontend CI result
         id: gate
         shell: bash
@@ -60,7 +62,6 @@ jobs:
 
           echo "Checking target Frontend CI execution..."
 
-          # Identify target run based on event type.
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
             TARGET_RUN_ID="$EVENT_RUN_ID"
           elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
@@ -70,15 +71,11 @@ jobs:
             exit 1
           fi
 
-          # Validate run ID.
           if [[ ! "$TARGET_RUN_ID" =~ ^[0-9]+$ ]]; then
-            echo "::error::Invalid or missing workflow run ID."
+            echo "::error::Invalid workflow run ID."
             exit 1
           fi
 
-          echo "Target Run ID: $TARGET_RUN_ID"
-
-          # Retrieve actual workflow run details.
           RUN_DATA=$(gh api \
             "repos/${REPOSITORY}/actions/runs/${TARGET_RUN_ID}")
 
@@ -90,48 +87,34 @@ jobs:
           HEAD_REPOSITORY=$(jq -r '.head_repository.full_name // ""' <<< "$RUN_DATA")
           RUN_URL=$(jq -r '.html_url // ""' <<< "$RUN_DATA")
 
-          echo "--------------------------------------"
-          echo "Workflow       : $WORKFLOW_NAME"
-          echo "Branch         : $BRANCH"
-          echo "Status         : $STATUS"
-          echo "Conclusion     : $CONCLUSION"
-          echo "Source SHA     : $SOURCE_SHA"
-          echo "Source Repo    : $HEAD_REPOSITORY"
-          echo "--------------------------------------"
+          echo "Workflow: $WORKFLOW_NAME"
+          echo "Branch: $BRANCH"
+          echo "Conclusion: $CONCLUSION"
+          echo "Source SHA: $SOURCE_SHA"
 
-          # Validate workflow name.
           if [[ "$WORKFLOW_NAME" != "Frontend CI" ]]; then
             echo "::error::Expected Frontend CI workflow."
             exit 1
           fi
 
-          # Reject external repository runs.
           if [[ "$HEAD_REPOSITORY" != "$REPOSITORY" ]]; then
-            echo "::error::Runs from external repositories are not allowed."
+            echo "::error::External repository runs are not allowed."
             exit 1
           fi
 
-          # Validate source branch.
-          # Supports feature/login and feature/ui/header.
           if [[ "$BRANCH" != feature/* ]]; then
             echo "::error::Only feature/* branches are allowed."
             exit 1
           fi
 
-          # Validate source commit SHA.
           if [[ ! "$SOURCE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "::error::Invalid source commit SHA."
             exit 1
           fi
 
-          # Ensure the originating event and API identify
-          # the same commit and branch.
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
-
             if [[ "$SOURCE_SHA" != "$EVENT_SOURCE_SHA" ]]; then
               echo "::error::Source SHA mismatch."
-              echo "Event SHA: $EVENT_SOURCE_SHA"
-              echo "API SHA:   $SOURCE_SHA"
               exit 1
             fi
 
@@ -139,136 +122,54 @@ jobs:
               echo "::error::Source branch mismatch."
               exit 1
             fi
-
           fi
 
-          # Ensure source workflow has completed.
           if [[ "$STATUS" != "completed" ]]; then
-            echo "::error::Target workflow has not completed."
+            echo "::error::Source workflow has not completed."
             exit 1
           fi
 
-          # Set common outputs.
           echo "should_diagnose=false" >> "$GITHUB_OUTPUT"
           echo "run_id=$TARGET_RUN_ID" >> "$GITHUB_OUTPUT"
           echo "source_sha=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
           echo "source_branch=$BRANCH" >> "$GITHUB_OUTPUT"
 
-          # ==========================================
-          # DECISION 1: FRONTEND CI SUCCESS
-          # ==========================================
-          if [[ "$CONCLUSION" == "success" ]]; then
-
-            echo "Frontend CI completed successfully."
-            echo "No diagnostic analysis is required."
-
-            {
-              echo "## ✅ Frontend CI completed successfully"
-              echo ""
-              echo "No failures detected. Diagnostic analysis was not required."
-              echo ""
-              echo "- **Repository:** $REPOSITORY"
-              echo "- **Branch:** $BRANCH"
-              echo "- **Run ID:** [$TARGET_RUN_ID]($RUN_URL)"
-              echo "- **Source SHA:** \`$SOURCE_SHA\`"
-              echo "- **Diagnosis:** Not required"
-              echo "- **Python controller:** Not invoked"
-              echo "- **AI:** Disabled"
-              echo "- **Recovery:** Not applicable"
-            } >> "$GITHUB_STEP_SUMMARY"
-
-          # ==========================================
-          # DECISION 2: FRONTEND CI FAILURE
-          # ==========================================
-          elif [[ "$CONCLUSION" == "failure" ]]; then
-
+          if [[ "$CONCLUSION" == "failure" ]]; then
             echo "should_diagnose=true" >> "$GITHUB_OUTPUT"
 
-            echo "Frontend CI failure detected."
-            echo "Starting diagnostic analysis."
-
             {
-              echo "## ❌ Frontend CI failure detected"
+              echo "## Frontend CI failure detected"
               echo ""
-              echo "Starting automated failure diagnosis."
-              echo ""
-              echo "- **Repository:** $REPOSITORY"
-              echo "- **Branch:** $BRANCH"
-              echo "- **Run ID:** [$TARGET_RUN_ID]($RUN_URL)"
-              echo "- **Source SHA:** \`$SOURCE_SHA\`"
-              echo "- **Diagnosis:** In progress"
-              echo "- **AI:** Disabled"
-              echo "- **Recovery:** Disabled"
+              echo "- Repository: $REPOSITORY"
+              echo "- Branch: $BRANCH"
+              echo "- Run: [$TARGET_RUN_ID]($RUN_URL)"
+              echo "- Source SHA: \`$SOURCE_SHA\`"
+              echo "- Diagnosis: Starting"
             } >> "$GITHUB_STEP_SUMMARY"
 
-          # ==========================================
-          # DECISION 3: OTHER CONCLUSIONS
-          # ==========================================
+          elif [[ "$CONCLUSION" == "success" ]]; then
+            {
+              echo "## Frontend CI completed successfully"
+              echo ""
+              echo "No diagnosis required."
+            } >> "$GITHUB_STEP_SUMMARY"
+
           else
-
-            echo "Diagnosis not required."
-            echo "Frontend CI conclusion: $CONCLUSION"
-
-            {
-              echo "## ℹ️ Diagnosis not required"
-              echo ""
-              echo "Frontend CI completed with conclusion: **$CONCLUSION**"
-              echo ""
-              echo "- **Branch:** $BRANCH"
-              echo "- **Source SHA:** \`$SOURCE_SHA\`"
-              echo "- **Diagnosis:** Not required"
-            } >> "$GITHUB_STEP_SUMMARY"
-
+            echo "Diagnosis not required: $CONCLUSION"
           fi
 
-      # ==================================================
-      # STEP 2: CHECKOUT CONTROLLER FROM SOURCE COMMIT
-      # ==================================================
-      - name: Checkout diagnostic controller from source commit
-        id: checkout-controller
+      # STEP 2: CHECKOUT TRUSTED CONTROLLER SOURCE
+      # Do not execute controller code from the failed feature branch.
+      - name: Checkout diagnostic controller
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
         uses: actions/checkout@v7
         with:
           repository: ${{ github.repository }}
-          ref: ${{ steps.gate.outputs.source_sha }}
+          ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
           persist-credentials: false
 
-      # ==================================================
-      # STEP 3: VERIFY CHECKED OUT COMMIT
-      # ==================================================
-      - name: Verify diagnostic controller commit
-        if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
-        shell: bash
-        env:
-          EXPECTED_SHA: ${{ steps.gate.outputs.source_sha }}
-        run: |
-          set -euo pipefail
-
-          ACTUAL_SHA=$(git rev-parse HEAD)
-
-          echo "Expected source SHA: $EXPECTED_SHA"
-          echo "Actual checkout SHA: $ACTUAL_SHA"
-
-          if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
-            echo "::error::Controller checkout does not match source CI commit."
-            exit 1
-          fi
-
-          echo "Controller source commit verified successfully."
-
-          {
-            echo ""
-            echo "### Controller source verification"
-            echo ""
-            echo "- **Expected SHA:** \`$EXPECTED_SHA\`"
-            echo "- **Actual SHA:** \`$ACTUAL_SHA\`"
-            echo "- **Verification:** Passed"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      # ==================================================
-      # STEP 4: SETUP PYTHON
-      # ==================================================
+      # STEP 3: SETUP PYTHON
       - name: Set up Python
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
         uses: actions/setup-python@v7
@@ -277,21 +178,16 @@ jobs:
           cache: pip
           cache-dependency-path: pyproject.toml
 
-      # ==================================================
-      # STEP 5: INSTALL PYTHON CONTROLLER
-      # ==================================================
+      # STEP 4: INSTALL CONTROLLER
       - name: Install Python dependencies
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
-
           python -m pip install --upgrade pip
           python -m pip install .
 
-      # ==================================================
-      # STEP 6: ANALYZE FRONTEND FAILURE
-      # ==================================================
+      # STEP 5: DETERMINISTIC FAILURE ANALYSIS
       - name: Analyze failed frontend workflow
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
         shell: bash
@@ -299,6 +195,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
           RUN_ID: ${{ steps.gate.outputs.run_id }}
+
         run: |
           set -euo pipefail
 
@@ -315,9 +212,51 @@ jobs:
             --rules "$GITHUB_WORKSPACE/config/rules.yaml" \
             --output-dir "$GITHUB_WORKSPACE/reports"
 
-      # ==================================================
+      # STEP 6: DETERMINE APPROVAL REQUIREMENT
+      - name: Evaluate human approval requirement
+        id: approval
+        if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          REPORT=$(find reports -maxdepth 1 -name '*.json' -type f | head -n 1)
+
+          if [[ -z "$REPORT" ]]; then
+            echo "::error::Diagnosis report not found."
+            exit 1
+          fi
+
+          echo "Reading diagnosis report: $REPORT"
+
+          APPROVAL_REQUIRED=$(jq -r '
+            [
+              .analyses[]?
+              | .diagnosis.remediation_plan?
+              | select(
+                  .decision == "approval_required"
+                  and .eligible == true
+                  and .requires_approval == true
+                )
+            ] | length > 0
+          ' "$REPORT")
+
+          echo "Approval required: $APPROVAL_REQUIRED"
+
+          echo "required=$APPROVAL_REQUIRED" >> "$GITHUB_OUTPUT"
+
+          {
+            echo ""
+            echo "## Remediation approval assessment"
+            echo ""
+            if [[ "$APPROVAL_REQUIRED" == "true" ]]; then
+              echo "<escape> </escape>Human approval is required."
+            else
+              echo "No human approval gate was triggered."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       # STEP 7: UPLOAD DIAGNOSIS REPORT
-      # ==================================================
       - name: Upload diagnosis report
         if: ${{ always() && steps.gate.outputs.should_diagnose == 'true' }}
         uses: actions/upload-artifact@v7
@@ -326,3 +265,53 @@ jobs:
           path: reports/*.json
           if-no-files-found: ignore
           retention-days: 7
+
+
+  # ==================================================
+  # JOB 2: HUMAN APPROVAL GATE
+  # ==================================================
+  remediation-approval:
+
+    name: Human Approval for Remediation Proposal
+
+    needs: diagnose
+
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
+      }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+
+    environment:
+      name: remediation-approval
+
+    steps:
+
+      - name: Record approved remediation proposal
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Human approval received."
+          echo "Remediation execution remains disabled."
+
+          {
+            echo ""
+            echo "## Human approval received"
+            echo ""
+            echo "- Approval mechanism: GitHub Environment"
+            echo "- Environment: remediation-approval"
+            echo "- Reviewer approval: Granted"
+            echo "- Remediation execution: Disabled"
+            echo "- Validation commands: Not executed"
+            echo "- Source modifications: None"
+            echo "- Commit/push: Not performed"
+            echo ""
+            echo "The proposal has been approved for the next implementation stage."
+          } >> "$GITHUB_STEP_SUMMARY"
