@@ -6,5 +6,5 @@ const path = require('node:path');
 
 test('frontend entry page exists and has a title', () => {
   const page = fs.readFileSync(path.join(__dirname, '..', 'src', 'index.html'), 'utf8');
-  assert.match(page, /<title>CI\/CD Recovery Dashboard<\/title>/);
+  assert.match(page, /<title>CI\/CD Recovery Demo<\/title>/);
 });
