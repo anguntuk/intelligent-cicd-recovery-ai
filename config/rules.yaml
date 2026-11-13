@@ -104,8 +104,9 @@ rules:
       4. Correct the relevant implementation or test data without deleting, skipping or weakening the assertion.
       5. Run npm test and npm run build to validate the correction.
       
-      This deterministic assertion failure is not eligible for automatic retry.
-      No source-code modification or remediation is performed by this diagnostic controller.
+      This rule is eligible for a reviewed, exact-match remediation recipe only. The local
+      executor currently supports the frontend_title_mismatch_v1 recipe. A human must approve
+      the recipe before it runs. Validation failure stops execution and rolls back the recipe.
     retry_candidate: true
     remediation:
       enabled: true
@@ -113,11 +114,10 @@ rules:
       mode: assisted
       approval_required: true
       max_attempts: 1
-
+      recipe_id: frontend_title_mismatch_v1
       validation:
         - npm test
         - npm run build
-
       target_branch: originating_feature_branch
       commit_only_after_validation: true
 
