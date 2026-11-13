@@ -449,7 +449,7 @@ jobs:
 
       # STEP 1: DOWNLOAD DIAGNOSIS EVIDENCE
       - name: Download diagnosis report
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: frontend-diagnosis-${{ needs.diagnose.outputs.source_run_id }}
           path: diagnosis
@@ -582,13 +582,15 @@ jobs:
 
           npm ci --ignore-scripts --no-audit --no-fund
 
-      # STEP 9: EXECUTE APPROVED RECIPE
+            # STEP 9: EXECUTE REMEDIATION AND CREATE REVIEWABLE PATCH
       - name: Execute approved unit test remediation
         id: remediation
         shell: bash
         env:
           SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
           SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+          CONTROLLER_SHA: ${{ needs.diagnose.outputs.controller_sha }}
 
         run: |
           set -euo pipefail
@@ -597,6 +599,8 @@ jobs:
           echo "Recipe: frontend_title_mismatch_v2"
           echo "Source branch: $SOURCE_BRANCH"
           echo "Source SHA: $SOURCE_SHA"
+
+          mkdir -p source/reports handoff
 
           mapfile -t REPORTS < <(
             find diagnosis \
@@ -612,8 +616,6 @@ jobs:
           fi
 
           REPORT="${REPORTS[0]}"
-
-          mkdir -p source/reports
 
           set +e
 
@@ -631,27 +633,155 @@ jobs:
 
           cat "$GITHUB_WORKSPACE/remediation-execution.log"
 
-          AUDIT=$(find source/reports \
-            -maxdepth 1 \
-            -name 'remediation-frontend_title_mismatch_v2-*.json' \
-            -type f \
-            | sort \
-            | tail -n 1 || true)
+          mapfile -t AUDIT_FILES < <(
+            find source/reports \
+              -maxdepth 1 \
+              -type f \
+              -name 'remediation-frontend_title_mismatch_v2-*.json' \
+              -print
+          )
 
-          if [[ -z "$AUDIT" ]]; then
-            {
-              echo ""
-              echo "## Remediation execution failed"
-              echo ""
-              echo "No v2 audit report was generated."
-              echo "Check the execution log."
-            } >> "$GITHUB_STEP_SUMMARY"
-
-            echo "::error::Remediation audit report was not generated."
+          if [[ "${#AUDIT_FILES[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one remediation audit report."
             exit 1
           fi
 
+          AUDIT="${AUDIT_FILES[0]}"
+
           STATUS=$(jq -r '.status // "unknown"' "$AUDIT")
+
+          if [[ "$EXIT_CODE" -ne 0 ]]; then
+            echo "::error::Remediation execution failed with exit code $EXIT_CODE."
+            exit "$EXIT_CODE"
+          fi
+
+          if [[ "$STATUS" != "validated_pending_commit_approval" ]]; then
+            echo "::error::Unexpected remediation status: $STATUS"
+            exit 1
+          fi
+
+          # Verify the audit before creating a commit handoff.
+          jq -e \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" '
+              .schema_version == 2
+              and .recipe_id == "frontend_title_mismatch_v2"
+              and .status == "validated_pending_commit_approval"
+              and .approval.received == true
+              and .applicability.diagnosis.source_sha == $source_sha
+              and .applicability.diagnosis.source_branch == $source_branch
+              and (.changed_files | type) == "array"
+              and (.changed_files | length) > 0
+              and (.changed_files | length) == (.changed_files | unique | length)
+              and all(
+                .changed_files[];
+                . == "frontend/src/index.html"
+                or . == "frontend/test/app.test.js"
+                or . == "frontend/test/known-issue-demo.test.js"
+              )
+              and (.validation | length) == 2
+              and (
+                .validation | map(.command)
+              ) == ["npm test", "npm run build"]
+              and (.validation | all(.passed == true))
+              and .commit_performed == false
+              and .push_performed == false
+              and .ci_retry_triggered == false
+              and (.after_sha256 | has("frontend/src/index.html"))
+              and (.after_sha256 | has("frontend/test/app.test.js"))
+              and (.after_sha256 | has("frontend/test/known-issue-demo.test.js"))
+            ' "$AUDIT" > /dev/null
+
+          mapfile -t CHANGED_FILES < <(
+            jq -r '.changed_files[]' "$AUDIT"
+          )
+
+          mapfile -t DIFF_FILES < <(
+            git -C source diff --name-only
+          )
+
+          if [[ "${#CHANGED_FILES[@]}" -eq 0 ]]; then
+            echo "::error::No changed files to hand off. Refusing to create an empty commit."
+            exit 1
+          fi
+
+          if [[ "${#DIFF_FILES[@]}" -eq 0 ]]; then
+            echo "::error::Git did not detect the audited file changes."
+            exit 1
+          fi
+
+          # Confirm that the audit and actual Git diff identify exactly
+          # the same files.
+          printf '%s\n' "${CHANGED_FILES[@]}" \
+            | LC_ALL=C sort > handoff/audit-files.txt
+
+          printf '%s\n' "${DIFF_FILES[@]}" \
+            | LC_ALL=C sort > handoff/git-diff-files.txt
+
+          if ! diff -u handoff/audit-files.txt handoff/git-diff-files.txt; then
+            echo "::error::Audit changed_files does not match the actual Git diff."
+            exit 1
+          fi
+
+          # Refuse unexpected untracked files in the source checkout.
+          UNTRACKED_FILES=$(git -C source ls-files --others --exclude-standard)
+
+          if [[ -n "$UNTRACKED_FILES" ]]; then
+            echo "::error::Unexpected untracked files found in source checkout:"
+            echo "$UNTRACKED_FILES"
+            exit 1
+          fi
+
+          # Generate a binary-safe patch containing only audited files.
+          git -C source diff \
+            --binary \
+            --no-ext-diff \
+            -- "${CHANGED_FILES[@]}" \
+            > handoff/remediation.patch
+
+          if [[ ! -s handoff/remediation.patch ]]; then
+            echo "::error::Generated remediation patch is empty."
+            exit 1
+          fi
+
+          git -C source apply --stat \
+            "$GITHUB_WORKSPACE/handoff/remediation.patch" \
+            > handoff/patch-stat.txt
+
+          # Copy the audit into the handoff bundle.
+          cp "$AUDIT" handoff/audit.json
+
+          PATCH_SHA256=$(sha256sum handoff/remediation.patch | awk '{print $1}')
+          AUDIT_SHA256=$(sha256sum handoff/audit.json | awk '{print $1}')
+          CHANGED_FILES_JSON=$(jq -c '.changed_files' "$AUDIT")
+
+          # Create a manifest binding the patch and audit to this exact run.
+          jq -n \
+            --arg recipe_id "frontend_title_mismatch_v2" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_run_id "$SOURCE_RUN_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --arg controller_sha "$CONTROLLER_SHA" \
+            --arg patch_sha256 "$PATCH_SHA256" \
+            --arg audit_sha256 "$AUDIT_SHA256" \
+            --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson changed_files "$CHANGED_FILES_JSON" \
+            '{
+              schema_version: 1,
+              recipe_id: $recipe_id,
+              repository: $repository,
+              source_run_id: $source_run_id,
+              source_sha: $source_sha,
+              source_branch: $source_branch,
+              controller_sha: $controller_sha,
+              generated_at: $generated_at,
+              patch_file: "remediation.patch",
+              patch_sha256: $patch_sha256,
+              audit_file: "audit.json",
+              audit_sha256: $audit_sha256,
+              changed_files: $changed_files
+            }' > handoff/manifest.json
 
           {
             echo ""
@@ -661,24 +791,583 @@ jobs:
             echo "- Result: $STATUS"
             echo "- Source branch: $SOURCE_BRANCH"
             echo "- Source SHA: $SOURCE_SHA"
+            echo "- Changed files: ${#CHANGED_FILES[@]}"
+            echo "- Patch SHA256: $PATCH_SHA256"
+            echo "- Audit SHA256: $AUDIT_SHA256"
             echo "- Commit: Not performed"
             echo "- Push: Not performed"
             echo "- CI retry: Not performed"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [[ "$EXIT_CODE" -ne 0 ]]; then
-            echo "::error::Remediation or validation failed. No commit or retry will be performed."
-            exit "$EXIT_CODE"
-          fi
+          echo "Validated remediation patch and audit handoff created."
 
-      # STEP 10: UPLOAD REMEDIATION AUDIT
-      - name: Upload remediation audit and execution log
+
+      # STEP 10: PRESERVE EXECUTION EVIDENCE
+      - name: Upload remediation execution evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: remediation-result-${{ needs.diagnose.outputs.source_run_id }}
+          name: remediation-execution-evidence-${{ needs.diagnose.outputs.source_run_id }}
           path: |
             source/reports/*.json
             remediation-execution.log
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      # STEP 11: UPLOAD VALIDATED PATCH FOR REVIEW
+      - name: Upload validated remediation handoff
+        if: ${{ steps.remediation.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: validated-remediation-${{ needs.diagnose.outputs.source_run_id }}
+          path: handoff/
+          if-no-files-found: error
+          retention-days: 14
+  
+    # ==================================================
+  # JOB 4: REVIEW VALIDATED PATCH
+  # ==================================================
+  remediation-review:
+    name: Review Validated Remediation Patch
+
+    needs:
+      - diagnose
+      - remediation-execution
+
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.remediation-execution.result == 'success'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+
+      - name: Download validated remediation handoff
+        uses: actions/download-artifact@v8
+        with:
+          name: validated-remediation-${{ needs.diagnose.outputs.source_run_id }}
+          path: review
+
+      - name: Verify patch and audit evidence
+        shell: bash
+        env:
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+          SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          CONTROLLER_SHA: ${{ needs.diagnose.outputs.controller_sha }}
+
+        run: |
+          set -euo pipefail
+
+          for FILE in manifest.json remediation.patch audit.json; do
+            if [[ ! -s "review/$FILE" ]]; then
+              echo "::error::Missing or empty handoff file: $FILE"
+              exit 1
+            fi
+          done
+
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$SOURCE_RUN_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --arg controller_sha "$CONTROLLER_SHA" '
+              .schema_version == 1
+              and .recipe_id == "frontend_title_mismatch_v2"
+              and .repository == $repository
+              and .source_run_id == $run_id
+              and .source_sha == $source_sha
+              and .source_branch == $source_branch
+              and .controller_sha == $controller_sha
+              and .patch_file == "remediation.patch"
+              and .audit_file == "audit.json"
+              and (.changed_files | type) == "array"
+              and (.changed_files | length) > 0
+            ' review/manifest.json > /dev/null
+
+          EXPECTED_PATCH_SHA=$(jq -r '.patch_sha256' review/manifest.json)
+          EXPECTED_AUDIT_SHA=$(jq -r '.audit_sha256' review/manifest.json)
+
+          ACTUAL_PATCH_SHA=$(sha256sum review/remediation.patch | awk '{print $1}')
+          ACTUAL_AUDIT_SHA=$(sha256sum review/audit.json | awk '{print $1}')
+
+          if [[ "$ACTUAL_PATCH_SHA" != "$EXPECTED_PATCH_SHA" ]]; then
+            echo "::error::Remediation patch SHA256 mismatch."
+            exit 1
+          fi
+
+          if [[ "$ACTUAL_AUDIT_SHA" != "$EXPECTED_AUDIT_SHA" ]]; then
+            echo "::error::Remediation audit SHA256 mismatch."
+            exit 1
+          fi
+
+          MANIFEST_FILES=$(jq -c '.changed_files' review/manifest.json)
+
+          jq -e \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --argjson manifest_files "$MANIFEST_FILES" '
+              .schema_version == 2
+              and .recipe_id == "frontend_title_mismatch_v2"
+              and .status == "validated_pending_commit_approval"
+              and .approval.received == true
+              and .applicability.diagnosis.source_sha == $source_sha
+              and .applicability.diagnosis.source_branch == $source_branch
+              and .changed_files == $manifest_files
+              and (.validation | length) == 2
+              and (
+                .validation | map(.command)
+              ) == ["npm test", "npm run build"]
+              and (.validation | all(.passed == true))
+              and .commit_performed == false
+              and .push_performed == false
+              and .ci_retry_triggered == false
+              and all(
+                .changed_files[];
+                . == "frontend/src/index.html"
+                or . == "frontend/test/app.test.js"
+                or . == "frontend/test/known-issue-demo.test.js"
+              )
+            ' review/audit.json > /dev/null
+
+          git apply --stat review/remediation.patch \
+            | tee review/patch-stat.txt
+
+          echo "Patch and audit evidence verified."
+
+          {
+            echo "## Validated remediation patch — ready for review"
+            echo ""
+            echo "- Recipe: frontend_title_mismatch_v2"
+            echo "- Source branch: $SOURCE_BRANCH"
+            echo "- Source SHA: \`$SOURCE_SHA\`"
+            echo "- Source workflow run: $SOURCE_RUN_ID"
+            echo "- Controller SHA: \`$CONTROLLER_SHA\`"
+            echo "- Patch SHA256: \`$ACTUAL_PATCH_SHA\`"
+            echo "- Audit SHA256: \`$ACTUAL_AUDIT_SHA\`"
+            echo ""
+            echo "### Files proposed for change"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r FILE; do
+            echo "- \`$FILE\`" >> "$GITHUB_STEP_SUMMARY"
+          done < <(jq -r '.changed_files[]' review/manifest.json)
+
+          {
+            echo ""
+            echo "### Validation results"
+            echo ""
+            echo "| Command | Passed |"
+            echo "|---|---|"
+            echo "| npm test | Yes |"
+            echo "| npm run build | Yes |"
+            echo ""
+            echo "### Actual proposed patch"
+            echo ""
+            echo '```diff'
+            cat review/remediation.patch
+            echo '```'
+            echo ""
+            echo "### Approval boundary"
+            echo ""
+            echo "No commit or push has been performed."
+            echo "A second human approval is required before the commit job can run."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+    # ==================================================
+  # JOB 5: SECOND HUMAN APPROVAL FOR COMMIT
+  # ==================================================
+  commit-approval:
+    name: Second Human Approval - Commit Validated Remediation
+
+    needs:
+      - diagnose
+      - remediation-review
+
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+
+    environment:
+      name: remediation-commit-approval
+
+    steps:
+
+      - name: Record second approval
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Second human approval received"
+            echo ""
+            echo "- Approval mechanism: GitHub Environment"
+            echo "- Environment: remediation-commit-approval"
+            echo "- Patch review job: Successful"
+            echo "- Validated patch: Approved for commit"
+            echo "- Target: Originating feature branch"
+            echo "- Force push: Not allowed"
+            echo "- CI retry API: Not used"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+    # ==================================================
+  # JOB 6: COMMIT AND PUSH AFTER SECOND APPROVAL
+  # ==================================================
+  commit-push:
+    name: Commit Approved Remediation to Feature Branch
+
+    needs:
+      - diagnose
+      - remediation-review
+      - commit-approval
+
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.remediation-review.result == 'success'
+        && needs.commit-approval.result == 'success'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    # Write permission is restricted to this approved job only.
+    permissions:
+      contents: write
+      actions: read
+
+    steps:
+
+      # STEP 1: DOWNLOAD THE EXACT PATCH THAT WAS REVIEWED
+      - name: Download approved remediation handoff
+        uses: actions/download-artifact@v8
+        with:
+          name: validated-remediation-${{ needs.diagnose.outputs.source_run_id }}
+          path: review
+
+      # STEP 2: CHECKOUT THE ORIGINATING FEATURE BRANCH
+      - name: Checkout originating feature branch
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.diagnose.outputs.source_branch }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ github.token }}
+
+      # STEP 3: VERIFY BASE SHA, MANIFEST, AUDIT AND PATCH
+      - name: Verify approved patch and source revision
+        shell: bash
+        env:
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+          SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          CONTROLLER_SHA: ${{ needs.diagnose.outputs.controller_sha }}
+
+        run: |
+          set -euo pipefail
+
+          if [[ "$SOURCE_BRANCH" != feature/* ]]; then
+            echo "::error::Commit is restricted to feature/* branches."
+            exit 1
+          fi
+
+          for FILE in manifest.json remediation.patch audit.json; do
+            if [[ ! -s "review/$FILE" ]]; then
+              echo "::error::Missing approved handoff file: $FILE"
+              exit 1
+            fi
+          done
+
+          # Verify that the manifest belongs to this exact workflow run.
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$SOURCE_RUN_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --arg controller_sha "$CONTROLLER_SHA" '
+              .schema_version == 1
+              and .recipe_id == "frontend_title_mismatch_v2"
+              and .repository == $repository
+              and .source_run_id == $run_id
+              and .source_sha == $source_sha
+              and .source_branch == $source_branch
+              and .controller_sha == $controller_sha
+              and .patch_file == "remediation.patch"
+              and .audit_file == "audit.json"
+              and (.changed_files | type) == "array"
+              and (.changed_files | length) > 0
+            ' review/manifest.json > /dev/null
+
+          EXPECTED_PATCH_SHA=$(jq -r '.patch_sha256' review/manifest.json)
+          EXPECTED_AUDIT_SHA=$(jq -r '.audit_sha256' review/manifest.json)
+
+          ACTUAL_PATCH_SHA=$(sha256sum review/remediation.patch | awk '{print $1}')
+          ACTUAL_AUDIT_SHA=$(sha256sum review/audit.json | awk '{print $1}')
+
+          if [[ "$ACTUAL_PATCH_SHA" != "$EXPECTED_PATCH_SHA" ]]; then
+            echo "::error::Approved patch SHA256 mismatch."
+            exit 1
+          fi
+
+          if [[ "$ACTUAL_AUDIT_SHA" != "$EXPECTED_AUDIT_SHA" ]]; then
+            echo "::error::Approved audit SHA256 mismatch."
+            exit 1
+          fi
+
+          MANIFEST_FILES=$(jq -c '.changed_files' review/manifest.json)
+
+          # Revalidate audit status, validation results and change allowlist.
+          jq -e \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --argjson manifest_files "$MANIFEST_FILES" '
+              .schema_version == 2
+              and .recipe_id == "frontend_title_mismatch_v2"
+              and .status == "validated_pending_commit_approval"
+              and .approval.received == true
+              and .applicability.diagnosis.source_sha == $source_sha
+              and .applicability.diagnosis.source_branch == $source_branch
+              and .changed_files == $manifest_files
+              and (.validation | length) == 2
+              and (
+                .validation | map(.command)
+              ) == ["npm test", "npm run build"]
+              and (.validation | all(.passed == true))
+              and .commit_performed == false
+              and .push_performed == false
+              and .ci_retry_triggered == false
+              and all(
+                .changed_files[];
+                . == "frontend/src/index.html"
+                or . == "frontend/test/app.test.js"
+                or . == "frontend/test/known-issue-demo.test.js"
+              )
+            ' review/audit.json > /dev/null
+
+          # Fail closed if the source branch changed after diagnosis.
+          ACTUAL_SOURCE_SHA=$(git -C source rev-parse HEAD)
+
+          if [[ "$ACTUAL_SOURCE_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::Feature branch has advanced since diagnosis."
+            echo "Expected: $SOURCE_SHA"
+            echo "Actual:   $ACTUAL_SOURCE_SHA"
+            echo "A fresh diagnosis and approval are required."
+            exit 1
+          fi
+
+          if [[ -n "$(git -C source status --porcelain)" ]]; then
+            echo "::error::Feature branch checkout is not clean."
+            exit 1
+          fi
+
+          echo "Source revision and approved handoff verified."
+
+      # STEP 4: APPLY ONLY THE REVIEWED PATCH
+      - name: Apply and verify approved patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git -C source apply --check \
+            "$GITHUB_WORKSPACE/review/remediation.patch"
+
+          git -C source apply \
+            "$GITHUB_WORKSPACE/review/remediation.patch"
+
+          mapfile -t EXPECTED_FILES < <(
+            jq -r '.changed_files[]' review/manifest.json
+          )
+
+          mapfile -t ACTUAL_FILES < <(
+            git -C source diff --name-only
+          )
+
+          printf '%s\n' "${EXPECTED_FILES[@]}" \
+            | LC_ALL=C sort > review/expected-files.txt
+
+          printf '%s\n' "${ACTUAL_FILES[@]}" \
+            | LC_ALL=C sort > review/actual-files.txt
+
+          if ! diff -u review/expected-files.txt review/actual-files.txt; then
+            echo "::error::Applied patch changed unexpected files."
+            exit 1
+          fi
+
+          # Compare resulting content against the hashes created by
+          # the successful remediation execution and stored in its audit.
+          for FILE in \
+            frontend/src/index.html \
+            frontend/test/app.test.js \
+            frontend/test/known-issue-demo.test.js
+          do
+            EXPECTED_SHA=$(jq -r \
+              --arg file "$FILE" \
+              '.after_sha256[$file] // empty' \
+              review/audit.json)
+
+            if [[ -z "$EXPECTED_SHA" ]]; then
+              echo "::error::Missing audited after_sha256 for $FILE"
+              exit 1
+            fi
+
+            ACTUAL_SHA=$(sha256sum "source/$FILE" | awk '{print $1}')
+
+            if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+              echo "::error::Post-apply file hash mismatch: $FILE"
+              exit 1
+            fi
+          done
+
+          git -C source diff --check
+
+          echo "Patch applied. All resulting file hashes match the validated audit."
+
+      # STEP 5: STAGE ONLY THE AUDITED FILES
+      - name: Stage approved files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t CHANGED_FILES < <(
+            jq -r '.changed_files[]' review/manifest.json
+          )
+
+          git -C source add -- "${CHANGED_FILES[@]}"
+
+          mapfile -t STAGED_FILES < <(
+            git -C source diff --cached --name-only
+          )
+
+          printf '%s\n' "${CHANGED_FILES[@]}" \
+            | LC_ALL=C sort > review/expected-staged-files.txt
+
+          printf '%s\n' "${STAGED_FILES[@]}" \
+            | LC_ALL=C sort > review/actual-staged-files.txt
+
+          if ! diff -u \
+            review/expected-staged-files.txt \
+            review/actual-staged-files.txt; then
+            echo "::error::Staged files do not match the approved file list."
+            exit 1
+          fi
+
+          if git -C source diff --cached --quiet; then
+            echo "::error::No changes available to commit."
+            exit 1
+          fi
+
+          echo "Only audited and approved files are staged."
+
+      # STEP 6: COMMIT AND PUSH
+      - name: Commit and push approved remediation
+        id: commit
+        shell: bash
+        env:
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+
+        run: |
+          set -euo pipefail
+
+          git -C source config user.name "github-actions[bot]"
+          git -C source config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git -C source commit \
+            -m "Apply approved CI remediation (run ${SOURCE_RUN_ID})"
+
+          COMMIT_SHA=$(git -C source rev-parse HEAD)
+
+          echo "Created commit: $COMMIT_SHA"
+          echo "Pushing to: $SOURCE_BRANCH"
+
+          set +e
+
+          git -C source push origin "HEAD:${SOURCE_BRANCH}"
+
+          PUSH_EXIT_CODE=$?
+
+          set -e
+
+          if [[ "$PUSH_EXIT_CODE" -eq 0 ]]; then
+            PUSH_STATUS="pushed"
+            PUSHED=true
+          else
+            PUSH_STATUS="push_rejected"
+            PUSHED=false
+          fi
+
+          jq -n \
+            --arg status "$PUSH_STATUS" \
+            --arg recipe_id "frontend_title_mismatch_v2" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg commit_sha "$COMMIT_SHA" \
+            --arg source_run_id "$SOURCE_RUN_ID" \
+            --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson commit_created true \
+            --argjson pushed "$PUSHED" \
+            '{
+              schema_version: 1,
+              status: $status,
+              recipe_id: $recipe_id,
+              source_run_id: $source_run_id,
+              source_branch: $source_branch,
+              source_sha: $source_sha,
+              commit_sha: $commit_sha,
+              commit_created: $commit_created,
+              pushed: $pushed,
+              ci_retry_triggered: false,
+              created_at: $created_at
+            }' > "$GITHUB_WORKSPACE/commit-result.json"
+
+          if [[ "$PUSH_EXIT_CODE" -ne 0 ]]; then
+            echo "::error::Commit was created locally, but GitHub rejected the push."
+            echo "Check branch protection rules and repository permissions."
+            exit 1
+          fi
+
+          {
+            echo ""
+            echo "## Approved remediation committed and pushed"
+            echo ""
+            echo "- Recipe: frontend_title_mismatch_v2"
+            echo "- Branch: $SOURCE_BRANCH"
+            echo "- Original SHA: \`$SOURCE_SHA\`"
+            echo "- New commit: \`$COMMIT_SHA\`"
+            echo "- Commit: Completed"
+            echo "- Push: Completed"
+            echo "- CI retry API: Not called"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # STEP 7: PRESERVE COMMIT RESULT
+      - name: Upload commit result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: remediation-commit-result-${{ needs.diagnose.outputs.source_run_id }}
+          path: commit-result.json
           if-no-files-found: warn
           retention-days: 14
