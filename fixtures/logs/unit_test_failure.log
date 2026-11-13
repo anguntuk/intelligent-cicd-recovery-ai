@@ -1,2 +1,10 @@
-AssertionError: expected 'ready' to equal 'done'
-Tests: 1 failed, 12 passed
+TAP version 13
+not ok 1 - known issue demo: frontend title expectation mismatch
+  error: |-
+    AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+    + actual - expected
+    + 'CI/CD Recovery Demo'
+    - 'CI/CD Recovery Dashboard'
+  code: 'ERR_ASSERTION'
+  operator: 'strictEqual'
+Tests: 1 failed, 1 passed
