@@ -106,7 +106,20 @@ rules:
       
       This deterministic assertion failure is not eligible for automatic retry.
       No source-code modification or remediation is performed by this diagnostic controller.
-    retry_candidate: false
+    retry_candidate: true
+    remediation:
+      enabled: true
+      risk: high
+      mode: assisted
+      approval_required: true
+      max_attempts: 1
+
+    validation:
+      - npm test
+      - npm run build
+      
+    target_branch: originating_feature_branch
+    commit_only_after_validation: true
 
   - id: frontend_build_failure
     category: frontend_build_failure
