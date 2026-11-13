@@ -49,6 +49,9 @@ jobs:
           REPOSITORY: ${{ github.repository }}
           PUSH_SHA: ${{ github.sha }}
           PUSH_BRANCH: ${{ github.ref_name }}
+          PUSH_ACTOR: ${{ github.actor }}
+          PUSH_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          APP_BOT_LOGIN: ${{ vars.APP_BOT_LOGIN }}
 
         run: |
           set -euo pipefail
@@ -56,6 +59,29 @@ jobs:
           echo "Repository: $REPOSITORY"
           echo "Feature branch: $PUSH_BRANCH"
           echo "Pushed commit: $PUSH_SHA"
+          echo "Push actor: $PUSH_ACTOR"
+
+          if [[ -z "$APP_BOT_LOGIN" ]]; then
+            echo "::error::Repository variable APP_BOT_LOGIN is not configured."
+            exit 1
+          fi
+
+          # The App-authenticated remediation commit must still trigger
+          # Frontend CI, but must not recursively start another diagnosis.
+          if [[ "$PUSH_ACTOR" == "$APP_BOT_LOGIN" \
+            && "$PUSH_COMMIT_MESSAGE" == *"CI-Recovery-Automated: true"* ]]; then
+            echo "should_diagnose=false" >> "$GITHUB_OUTPUT"
+            echo "Automated remediation commit detected; skipping diagnosis for this push."
+            {
+              echo "## Automated remediation commit detected"
+              echo ""
+              echo "- Actor: $PUSH_ACTOR"
+              echo "- Commit: \`$PUSH_SHA\`"
+              echo "- Diagnostics: Skipped to prevent recursion"
+              echo "- Frontend CI: Runs independently for this commit"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
           if [[ "$PUSH_BRANCH" != feature/* ]]; then
             echo "::error::Only feature/* branches are allowed."
@@ -1032,7 +1058,7 @@ jobs:
   # JOB 6: COMMIT AND PUSH AFTER SECOND APPROVAL
   # ==================================================
   commit-push:
-    name: Commit Approved Remediation to Feature Branch
+    name: Commit Approved Remediation and Verify Post-Push CI
 
     needs:
       - diagnose
@@ -1048,11 +1074,12 @@ jobs:
       }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 55
 
-    # Write permission is restricted to this approved job only.
+    # GITHUB_TOKEN remains read-only. The narrowly scoped GitHub App token
+    # is generated only after the second approval and only inside this job.
     permissions:
-      contents: write
+      contents: read
       actions: read
 
     steps:
@@ -1064,7 +1091,19 @@ jobs:
           name: validated-remediation-${{ needs.diagnose.outputs.source_run_id }}
           path: review
 
-      # STEP 2: CHECKOUT THE ORIGINATING FEATURE BRANCH
+      # STEP 2: CREATE A SHORT-LIVED, REPOSITORY-SCOPED GITHUB APP TOKEN
+      - name: Create GitHub App installation token
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-actions: read
+
+      # STEP 3: CHECKOUT THE ORIGINATING FEATURE BRANCH USING THE APP TOKEN
       - name: Checkout originating feature branch
         uses: actions/checkout@v7
         with:
@@ -1073,9 +1112,9 @@ jobs:
           path: source
           fetch-depth: 0
           persist-credentials: true
-          token: ${{ github.token }}
+          token: ${{ steps.app-token.outputs.token }}
 
-      # STEP 3: VERIFY BASE SHA, MANIFEST, AUDIT AND PATCH
+      # STEP 4: VERIFY BASE SHA, MANIFEST, AUDIT AND PATCH
       - name: Verify approved patch and source revision
         shell: bash
         env:
@@ -1083,12 +1122,19 @@ jobs:
           SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
           SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
           CONTROLLER_SHA: ${{ needs.diagnose.outputs.controller_sha }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          APP_BOT_LOGIN: ${{ vars.APP_BOT_LOGIN }}
 
         run: |
           set -euo pipefail
 
           if [[ "$SOURCE_BRANCH" != feature/* ]]; then
             echo "::error::Commit is restricted to feature/* branches."
+            exit 1
+          fi
+
+          if [[ -z "$APP_SLUG" || "$APP_BOT_LOGIN" != "${APP_SLUG}[bot]" ]]; then
+            echo "::error::APP_BOT_LOGIN must exactly match the installed GitHub App bot login: ${APP_SLUG}[bot]"
             exit 1
           fi
 
@@ -1099,7 +1145,6 @@ jobs:
             fi
           done
 
-          # Verify that the manifest belongs to this exact workflow run.
           jq -e \
             --arg repository "$GITHUB_REPOSITORY" \
             --arg run_id "$SOURCE_RUN_ID" \
@@ -1137,7 +1182,6 @@ jobs:
 
           MANIFEST_FILES=$(jq -c '.changed_files' review/manifest.json)
 
-          # Revalidate audit status, validation results and change allowlist.
           jq -e \
             --arg source_sha "$SOURCE_SHA" \
             --arg source_branch "$SOURCE_BRANCH" \
@@ -1150,9 +1194,7 @@ jobs:
               and .applicability.diagnosis.source_branch == $source_branch
               and .changed_files == $manifest_files
               and (.validation | length) == 2
-              and (
-                .validation | map(.command)
-              ) == ["npm test", "npm run build"]
+              and (.validation | map(.command)) == ["npm test", "npm run build"]
               and (.validation | all(.passed == true))
               and .commit_performed == false
               and .push_performed == false
@@ -1182,8 +1224,9 @@ jobs:
           fi
 
           echo "Source revision and approved handoff verified."
+          echo "GitHub App: $APP_SLUG"
 
-      # STEP 4: APPLY ONLY THE REVIEWED PATCH
+      # STEP 5: APPLY ONLY THE REVIEWED PATCH
       - name: Apply and verify approved patch
         shell: bash
         run: |
@@ -1214,8 +1257,6 @@ jobs:
             exit 1
           fi
 
-          # Compare resulting content against the hashes created by
-          # the successful remediation execution and stored in its audit.
           for FILE in \
             frontend/src/index.html \
             frontend/test/app.test.js \
@@ -1240,10 +1281,9 @@ jobs:
           done
 
           git -C source diff --check
-
           echo "Patch applied. All resulting file hashes match the validated audit."
 
-      # STEP 5: STAGE ONLY THE AUDITED FILES
+      # STEP 6: STAGE ONLY THE AUDITED FILES
       - name: Stage approved files
         shell: bash
         run: |
@@ -1279,11 +1319,13 @@ jobs:
 
           echo "Only audited and approved files are staged."
 
-      # STEP 6: COMMIT AND PUSH
+      # STEP 7: COMMIT AND PUSH USING THE GITHUB APP TOKEN
       - name: Commit and push approved remediation
         id: commit
         shell: bash
         env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
           SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
           SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
@@ -1291,12 +1333,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          git -C source config user.name "github-actions[bot]"
-          git -C source config user.email \
-            "41898282+github-actions[bot]@users.noreply.github.com"
+          BOT_USER_ID=$(gh api "/users/${APP_SLUG}[bot]" --jq '.id')
 
-          git -C source commit \
-            -m "Apply approved CI remediation (run ${SOURCE_RUN_ID})"
+          git -C source config user.name "${APP_SLUG}[bot]"
+          git -C source config user.email \
+            "${BOT_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+
+          # The marker is consumed by the diagnostics workflow's gate.
+          # It does not contain a GitHub CI-skip directive, so Frontend CI
+          # still runs for this App-authenticated push.
+          git -C source -c commit.cleanup=verbatim commit \
+            -m "Apply approved CI remediation (run ${SOURCE_RUN_ID})" \
+            -m "CI-Recovery-Automated: true"
 
           COMMIT_SHA=$(git -C source rev-parse HEAD)
 
@@ -1304,11 +1352,8 @@ jobs:
           echo "Pushing to: $SOURCE_BRANCH"
 
           set +e
-
           git -C source push origin "HEAD:${SOURCE_BRANCH}"
-
           PUSH_EXIT_CODE=$?
-
           set -e
 
           if [[ "$PUSH_EXIT_CODE" -eq 0 ]]; then
@@ -1326,11 +1371,12 @@ jobs:
             --arg source_sha "$SOURCE_SHA" \
             --arg commit_sha "$COMMIT_SHA" \
             --arg source_run_id "$SOURCE_RUN_ID" \
+            --arg app_slug "$APP_SLUG" \
             --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --argjson commit_created true \
             --argjson pushed "$PUSHED" \
             '{
-              schema_version: 1,
+              schema_version: 2,
               status: $status,
               recipe_id: $recipe_id,
               source_run_id: $source_run_id,
@@ -1339,13 +1385,23 @@ jobs:
               commit_sha: $commit_sha,
               commit_created: $commit_created,
               pushed: $pushed,
+              pushed_by_app: $app_slug,
+              post_push_ci: {
+                status: (if $pushed then "pending" else "not_started" end),
+                run_id: null,
+                conclusion: null,
+                url: null
+              },
               ci_retry_triggered: false,
               created_at: $created_at
             }' > "$GITHUB_WORKSPACE/commit-result.json"
 
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "pushed=$PUSHED" >> "$GITHUB_OUTPUT"
+
           if [[ "$PUSH_EXIT_CODE" -ne 0 ]]; then
             echo "::error::Commit was created locally, but GitHub rejected the push."
-            echo "Check branch protection rules and repository permissions."
+            echo "Check branch protection rules and GitHub App permissions."
             exit 1
           fi
 
@@ -1358,12 +1414,145 @@ jobs:
             echo "- Original SHA: \`$SOURCE_SHA\`"
             echo "- New commit: \`$COMMIT_SHA\`"
             echo "- Commit: Completed"
-            echo "- Push: Completed"
-            echo "- CI retry API: Not called"
+            echo "- Push: Completed using GitHub App: $APP_SLUG"
+            echo "- Post-push Frontend CI: Waiting"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # STEP 7: PRESERVE COMMIT RESULT
-      - name: Upload commit result
+      # STEP 8: WAIT FOR FRONTEND CI FOR THE EXACT REMEDIATION COMMIT
+      - name: Wait for post-remediation Frontend CI
+        id: post-push-ci
+        if: ${{ steps.commit.outputs.pushed == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+
+        run: |
+          set -euo pipefail
+
+          RUN_DATA=""
+
+          # The App token triggers the push workflows. Poll for the
+          # Frontend CI run whose head SHA is exactly our new commit.
+          for attempt in $(seq 1 180); do
+            echo "Waiting for Frontend CI (attempt $attempt/180)..."
+
+            if ! RUN_LIST=$(gh api \
+              --method GET \
+              "repos/${REPOSITORY}/actions/runs" \
+              -f branch="$SOURCE_BRANCH" \
+              -f event=push \
+              -f head_sha="$COMMIT_SHA" \
+              -F per_page=100); then
+              jq '.post_push_ci = {status: "api_error", run_id: null, conclusion: null, url: null} | .status = "pushed_ci_api_error"' \
+                commit-result.json > commit-result.tmp
+              mv commit-result.tmp commit-result.json
+              echo "::error::Could not query GitHub Actions runs using the GitHub App token."
+              exit 1
+            fi
+
+            MATCHING_RUN=$(jq -c \
+              --arg sha "$COMMIT_SHA" \
+              --arg branch "$SOURCE_BRANCH" \
+              --arg repo "$REPOSITORY" '
+                [
+                  .workflow_runs[]?
+                  | select(
+                      .name == "Frontend CI"
+                      and .head_sha == $sha
+                      and .head_branch == $branch
+                      and .event == "push"
+                      and .head_repository.full_name == $repo
+                    )
+                ]
+                | sort_by(.created_at)
+                | last // empty
+              ' <<< "$RUN_LIST")
+
+            if [[ -n "$MATCHING_RUN" ]]; then
+              RUN_STATUS=$(jq -r '.status // ""' <<< "$MATCHING_RUN")
+              RUN_ID=$(jq -r '.id // ""' <<< "$MATCHING_RUN")
+              RUN_URL=$(jq -r '.html_url // ""' <<< "$MATCHING_RUN")
+
+              echo "Matching Frontend CI run: $RUN_ID ($RUN_STATUS)"
+
+              if [[ "$RUN_STATUS" == "completed" ]]; then
+                RUN_DATA="$MATCHING_RUN"
+                break
+              fi
+            fi
+
+            sleep 10
+          done
+
+          if [[ -z "$RUN_DATA" ]]; then
+            jq '.post_push_ci = {status: "not_found_timeout", run_id: null, conclusion: null, url: null} | .status = "pushed_ci_not_found"' \
+              commit-result.json > commit-result.tmp
+            mv commit-result.tmp commit-result.json
+
+            {
+              echo ""
+              echo "## Post-push Frontend CI verification timed out"
+              echo ""
+              echo "- Commit: \`$COMMIT_SHA\`"
+              echo "- Branch: $SOURCE_BRANCH"
+              echo "- Waited: 30 minutes"
+              echo "- Commit and push remain completed; CI outcome is unknown."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            echo "::error::No completed Frontend CI run found for remediation commit $COMMIT_SHA within 30 minutes."
+            exit 1
+          fi
+
+          CI_RUN_ID=$(jq -r '.id | tostring' <<< "$RUN_DATA")
+          CI_CONCLUSION=$(jq -r '.conclusion // "unknown"' <<< "$RUN_DATA")
+          CI_URL=$(jq -r '.html_url // ""' <<< "$RUN_DATA")
+          CI_STATUS=$(jq -r '.status // "unknown"' <<< "$RUN_DATA")
+
+          if [[ "$CI_CONCLUSION" == "success" ]]; then
+            FINAL_STATUS="pushed_ci_success"
+          else
+            FINAL_STATUS="pushed_ci_failure"
+          fi
+
+          jq \
+            --arg final_status "$FINAL_STATUS" \
+            --arg ci_status "$CI_STATUS" \
+            --arg ci_run_id "$CI_RUN_ID" \
+            --arg ci_conclusion "$CI_CONCLUSION" \
+            --arg ci_url "$CI_URL" \
+            '.status = $final_status
+             | .post_push_ci = {
+                 status: $ci_status,
+                 run_id: $ci_run_id,
+                 conclusion: $ci_conclusion,
+                 url: $ci_url
+               }' \
+            commit-result.json > commit-result.tmp
+          mv commit-result.tmp commit-result.json
+
+          {
+            echo ""
+            echo "## Post-push Frontend CI result"
+            echo ""
+            echo "- Remediation commit: \`$COMMIT_SHA\`"
+            echo "- CI run: [$CI_RUN_ID]($CI_URL)"
+            echo "- Conclusion: $CI_CONCLUSION"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$CI_CONCLUSION" != "success" ]]; then
+            echo "::error::Post-remediation Frontend CI completed with conclusion: $CI_CONCLUSION"
+            echo "The remediation commit remains pushed. No automatic rollback or second remediation will be attempted."
+            exit 1
+          fi
+
+          echo "Post-remediation Frontend CI passed."
+
+      # STEP 9: PRESERVE COMMIT AND POST-PUSH CI RESULT
+      - name: Upload commit and post-push CI result
         if: always()
         uses: actions/upload-artifact@v7
         with:
