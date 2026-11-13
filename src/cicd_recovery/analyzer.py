@@ -1,3 +1,4 @@
+
 """Deterministic diagnosis and read-only remediation-policy planning."""
 from __future__ import annotations
 
@@ -15,14 +16,27 @@ UNKNOWN_RECOMMENDATION = (
 
 
 def analyze_job(
-    *, job: dict[str, Any], raw_log: str, rules: list[Rule],
-    max_excerpt_chars: int = 500, remediation_attempts_used: int = 0,
+    *,
+    job: dict[str, Any],
+    raw_log: str,
+    rules: list[Rule],
+    max_excerpt_chars: int = 3000,
+    remediation_attempts_used: int = 0,
 ) -> dict[str, Any]:
+    """Analyze one job using configured deterministic rules.
+
+    The returned sanitized_log_excerpt is evidence for later policy checks.
+    It must not be treated as proof that a remediation is safe by itself.
+    """
     safe_log = redact_text(raw_log)
     matches: list[RuleMatch] = match_rules(safe_log, rules)
+
     steps = job.get("steps") or []
     failed_steps = [
-        {"name": step.get("name", "(unnamed step)"), "conclusion": step.get("conclusion")}
+        {
+            "name": step.get("name", "(unnamed step)"),
+            "conclusion": step.get("conclusion"),
+        }
         for step in steps
         if step.get("conclusion") in {"failure", "timed_out", "cancelled"}
     ]
@@ -32,13 +46,22 @@ def analyze_job(
         category = primary.category
         title = primary.title
         recommendation = primary.recommendation
+
         evidence = [
-            {"rule_id": match.rule_id, "lines": list(match.evidence)} for match in matches
+            {
+                "rule_id": match.rule_id,
+                "lines": list(match.evidence),
+            }
+            for match in matches
         ]
+
         rule_ids = [match.rule_id for match in matches]
-        retry_candidate = any(match.retry_candidate for match in matches)
+        retry_candidate = any(
+            match.retry_candidate for match in matches
+        )
         remediation_spec = primary.remediation
         confidence = "rule_match"
+
     else:
         category = "unknown"
         title = "Unclassified CI/CD failure"
@@ -54,8 +77,16 @@ def analyze_job(
         remediation=remediation_spec,
         attempts_used=remediation_attempts_used,
     ).to_dict()
-    nonempty_lines = [line.strip() for line in safe_log.splitlines() if line.strip()]
-    excerpt = "\n".join(nonempty_lines[-8:])[-max_excerpt_chars:]
+
+    # Keep a bounded excerpt from the redacted log. The remediation executor
+    # checks this evidence before selecting its narrowly-scoped recipe.
+    nonempty_lines = [
+        line.strip()
+        for line in safe_log.splitlines()
+        if line.strip()
+    ]
+
+    excerpt = "\n".join(nonempty_lines[-40:])[-max_excerpt_chars:]
 
     return {
         "job_id": job.get("id"),
@@ -77,9 +108,13 @@ def analyze_job(
 
 
 def build_report(
-    *, repository: str, run: dict[str, Any], jobs: list[dict[str, Any]],
+    *,
+    repository: str,
+    run: dict[str, Any],
+    jobs: list[dict[str, Any]],
     analyses: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    """Build the JSON diagnosis report consumed by the CLI and workflow."""
     return {
         "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -88,13 +123,20 @@ def build_report(
         "recovery_enabled": False,
         "repository": repository,
         "workflow_run": {
-            "id": run.get("id"), "name": run.get("name"),
-            "workflow_id": run.get("workflow_id"), "event": run.get("event"),
-            "status": run.get("status"), "conclusion": run.get("conclusion"),
-            "head_branch": run.get("head_branch"), "head_sha": run.get("head_sha"),
+            "id": run.get("id"),
+            "name": run.get("name"),
+            "workflow_id": run.get("workflow_id"),
+            "event": run.get("event"),
+            "status": run.get("status"),
+            "conclusion": run.get("conclusion"),
+            "head_branch": run.get("head_branch"),
+            "head_sha": run.get("head_sha"),
             "run_number": run.get("run_number"),
             "run_attempt": run.get("run_attempt", 1),
-            "latest_run_attempt": run.get("latest_run_attempt", run.get("run_attempt", 1)),
+            "latest_run_attempt": run.get(
+                "latest_run_attempt",
+                run.get("run_attempt", 1),
+            ),
             "html_url": run.get("html_url"),
         },
         "job_count": len(jobs),
@@ -103,9 +145,9 @@ def build_report(
         "limitations": [
             "Diagnosis uses deterministic configured rules; no AI model is invoked.",
             "A matching signature is a diagnostic hypothesis and must be checked against context.",
-            "Remediation is policy-preview only: no code fix is generated or applied.",
-            "Validation commands are reported but not executed.",
-            "No approval request, retry, workflow mutation, deployment, commit, or push is performed.",
+            "Remediation is policy-preview only during diagnosis; no code fix is generated or applied.",
+            "Validation commands are reported but not executed during diagnosis.",
+            "No approval request, retry, workflow mutation, deployment, commit, or push is performed during diagnosis.",
             "Attempt counts are not persisted across workflow runs yet.",
             "Log redaction is best-effort and does not replace platform secret masking or review.",
         ],
