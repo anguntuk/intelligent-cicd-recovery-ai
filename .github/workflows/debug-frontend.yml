@@ -37,6 +37,11 @@ jobs:
 
     outputs:
       approval_required: ${{ steps.approval.outputs.required }}
+      supported_recipe: ${{ steps.approval.outputs.supported_recipe }}
+      source_run_id: ${{ steps.gate.outputs.run_id }}
+      source_sha: ${{ steps.gate.outputs.source_sha }}
+      source_branch: ${{ steps.gate.outputs.source_branch }}
+      controller_sha: ${{ steps.controller-revision.outputs.sha }}
 
     permissions:
       contents: read
@@ -60,8 +65,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          echo "Checking target Frontend CI execution..."
-
           if [[ "$EVENT_NAME" == "workflow_run" ]]; then
             TARGET_RUN_ID="$EVENT_RUN_ID"
           elif [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
@@ -76,8 +79,7 @@ jobs:
             exit 1
           fi
 
-          RUN_DATA=$(gh api \
-            "repos/${REPOSITORY}/actions/runs/${TARGET_RUN_ID}")
+          RUN_DATA=$(gh api "repos/${REPOSITORY}/actions/runs/${TARGET_RUN_ID}")
 
           WORKFLOW_NAME=$(jq -r '.name // ""' <<< "$RUN_DATA")
           BRANCH=$(jq -r '.head_branch // ""' <<< "$RUN_DATA")
@@ -144,7 +146,6 @@ jobs:
               echo "- Branch: $BRANCH"
               echo "- Run: [$TARGET_RUN_ID]($RUN_URL)"
               echo "- Source SHA: \`$SOURCE_SHA\`"
-              echo "- Diagnosis: Starting"
             } >> "$GITHUB_STEP_SUMMARY"
 
           elif [[ "$CONCLUSION" == "success" ]]; then
@@ -153,21 +154,29 @@ jobs:
               echo ""
               echo "No diagnosis required."
             } >> "$GITHUB_STEP_SUMMARY"
-
           else
             echo "Diagnosis not required: $CONCLUSION"
           fi
 
-      # STEP 2: CHECKOUT TRUSTED CONTROLLER SOURCE
-      # Do not execute controller code from the failed feature branch.
-      - name: Checkout diagnostic controller
+      # STEP 2: CHECKOUT TRUSTED CONTROLLER
+      - name: Checkout trusted diagnostic controller
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
         uses: actions/checkout@v7
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.event.repository.default_branch }}
+          path: controller
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Record trusted controller revision
+        id: controller-revision
+        if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA=$(git -C controller rev-parse HEAD)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       # STEP 3: SETUP PYTHON
       - name: Set up Python
@@ -176,20 +185,22 @@ jobs:
         with:
           python-version: '3.13'
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: controller/pyproject.toml
 
       # STEP 4: INSTALL CONTROLLER
       - name: Install Python dependencies
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
+        working-directory: controller
         shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install .
 
-      # STEP 5: DETERMINISTIC FAILURE ANALYSIS
+      # STEP 5: DIAGNOSE FAILURE
       - name: Analyze failed frontend workflow
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
+        working-directory: controller
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -199,9 +210,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p "$GITHUB_WORKSPACE/reports"
-
-          echo "Starting deterministic failure diagnosis..."
+          mkdir -p reports
 
           python -m cicd_recovery.cli diagnose \
             --repo "$REPOSITORY" \
@@ -209,10 +218,10 @@ jobs:
             --require-feature-branch \
             --require-failure \
             --expected-workflow-name "Frontend CI" \
-            --rules "$GITHUB_WORKSPACE/config/rules.yaml" \
-            --output-dir "$GITHUB_WORKSPACE/reports"
+            --rules "$GITHUB_WORKSPACE/controller/config/rules.yaml" \
+            --output-dir "$GITHUB_WORKSPACE/controller/reports"
 
-      # STEP 6: DETERMINE APPROVAL REQUIREMENT
+      # STEP 6: EVALUATE APPROVAL AND SUPPORTED RECIPE
       - name: Evaluate human approval requirement
         id: approval
         if: ${{ steps.gate.outputs.should_diagnose == 'true' }}
@@ -220,19 +229,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          REPORT=$(find reports -maxdepth 1 -name '*.json' -type f | head -n 1)
+          REPORT=$(find controller/reports -maxdepth 1 -name '*.json' -type f | head -n 1)
 
           if [[ -z "$REPORT" ]]; then
             echo "::error::Diagnosis report not found."
             exit 1
           fi
 
-          echo "Reading diagnosis report: $REPORT"
-
           APPROVAL_REQUIRED=$(jq -r '
             [
-              .analyses[]?
-              | .diagnosis.remediation_plan?
+              .analyses[]?.diagnosis.remediation_plan?
               | select(
                   .decision == "approval_required"
                   and .eligible == true
@@ -241,19 +247,35 @@ jobs:
             ] | length > 0
           ' "$REPORT")
 
+          SUPPORTED_RECIPE=$(jq -r '
+            (.analyses // []) as $analyses
+            | if ($analyses | length) != 1 then false
+              else
+                ($analyses[0].diagnosis // {}) as $d
+                | ($d.remediation_plan // {}) as $p
+                | (
+                    $d.category == "unit_test_failure"
+                    and (($d.matched_rule_ids // []) | index("unit_test_failure") != null)
+                    and $p.decision == "approval_required"
+                    and $p.eligible == true
+                    and $p.requires_approval == true
+                  )
+              end
+          ' "$REPORT")
+
           echo "Approval required: $APPROVAL_REQUIRED"
+          echo "Supported recipe: $SUPPORTED_RECIPE"
 
           echo "required=$APPROVAL_REQUIRED" >> "$GITHUB_OUTPUT"
+          echo "supported_recipe=$SUPPORTED_RECIPE" >> "$GITHUB_OUTPUT"
 
           {
             echo ""
-            echo "## Remediation approval assessment"
+            echo "## Remediation assessment"
             echo ""
-            if [[ "$APPROVAL_REQUIRED" == "true" ]]; then
-              echo "<escape> </escape>Human approval is required."
-            else
-              echo "No human approval gate was triggered."
-            fi
+            echo "- Approval required: $APPROVAL_REQUIRED"
+            echo "- Supported recipe: $SUPPORTED_RECIPE"
+            echo "- AI: Disabled"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # STEP 7: UPLOAD DIAGNOSIS REPORT
@@ -262,16 +284,15 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: frontend-diagnosis-${{ steps.gate.outputs.run_id }}
-          path: reports/*.json
-          if-no-files-found: ignore
+          path: controller/reports/*.json
+          if-no-files-found: error
           retention-days: 7
 
 
   # ==================================================
-  # JOB 2: HUMAN APPROVAL GATE
+  # JOB 2: FIRST HUMAN APPROVAL
   # ==================================================
   remediation-approval:
-
     name: Human Approval for Remediation Proposal
 
     needs: diagnose
@@ -292,26 +313,230 @@ jobs:
       name: remediation-approval
 
     steps:
-
       - name: Record approved remediation proposal
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "Human approval received."
-          echo "Remediation execution remains disabled."
-
           {
-            echo ""
             echo "## Human approval received"
             echo ""
             echo "- Approval mechanism: GitHub Environment"
             echo "- Environment: remediation-approval"
             echo "- Reviewer approval: Granted"
-            echo "- Remediation execution: Disabled"
-            echo "- Validation commands: Not executed"
-            echo "- Source modifications: None"
+            echo "- Remediation execution: Authorized"
             echo "- Commit/push: Not performed"
-            echo ""
-            echo "The proposal has been approved for the next implementation stage."
+            echo "- CI retry: Not performed"
           } >> "$GITHUB_STEP_SUMMARY"
+
+
+  # ==================================================
+  # JOB 3: APPROVED DETERMINISTIC REMEDIATION
+  # ==================================================
+  remediation-execution:
+    name: Execute Approved Remediation and Validate
+
+    needs:
+      - diagnose
+      - remediation-approval
+
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.remediation-approval.result == 'success'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+
+      # STEP 1: DOWNLOAD DIAGNOSIS EVIDENCE
+      - name: Download diagnosis report
+        uses: actions/download-artifact@v7
+        with:
+          name: frontend-diagnosis-${{ needs.diagnose.outputs.source_run_id }}
+          path: diagnosis
+
+      # STEP 2: CHECKOUT TRUSTED CONTROLLER
+      - name: Checkout trusted controller
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.diagnose.outputs.controller_sha }}
+          path: controller
+          fetch-depth: 1
+          persist-credentials: false
+
+      # STEP 3: CHECKOUT EXACT FAILED SOURCE COMMIT
+      - name: Checkout originating feature source
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.diagnose.outputs.source_sha }}
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+
+      # STEP 4: VERIFY REPORT AND SOURCE
+      - name: Verify diagnosis and source revision
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+          SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+
+        run: |
+          set -euo pipefail
+
+          REPORT=$(find diagnosis -maxdepth 1 -name '*.json' -type f | head -n 1)
+
+          if [[ -z "$REPORT" ]]; then
+            echo "::error::Diagnosis artifact is missing."
+            exit 1
+          fi
+
+          jq -e \
+            --arg repo "$REPOSITORY" \
+            --arg run "$SOURCE_RUN_ID" \
+            --arg sha "$SOURCE_SHA" \
+            --arg branch "$SOURCE_BRANCH" '
+              .repository == $repo
+              and ((.workflow_run.id | tostring) == $run)
+              and .workflow_run.head_sha == $sha
+              and .workflow_run.head_branch == $branch
+              and (.analyses | length) == 1
+              and .analyses[0].diagnosis.category == "unit_test_failure"
+              and (
+                (.analyses[0].diagnosis.matched_rule_ids // [])
+                | index("unit_test_failure") != null
+              )
+              and .analyses[0].diagnosis.remediation_plan.decision == "approval_required"
+              and .analyses[0].diagnosis.remediation_plan.eligible == true
+              and .analyses[0].diagnosis.remediation_plan.requires_approval == true
+            ' "$REPORT" > /dev/null
+
+          ACTUAL_SHA=$(git -C source rev-parse HEAD)
+
+          if [[ "$ACTUAL_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::Checked-out source SHA does not match failed CI SHA."
+            exit 1
+          fi
+
+          echo "Diagnosis report verified."
+          echo "Source branch: $SOURCE_BRANCH"
+          echo "Source SHA: $SOURCE_SHA"
+          echo "Approved recipe: frontend_title_mismatch_v1"
+
+      # STEP 5: SETUP PYTHON
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      # STEP 6: INSTALL TRUSTED CONTROLLER
+      - name: Install trusted controller
+        working-directory: controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install .
+
+      # STEP 7: SETUP NODE
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: source/frontend/package-lock.json
+
+      # STEP 8: INSTALL FRONTEND DEPENDENCIES
+      - name: Install frontend dependencies
+        working-directory: source/frontend
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+
+      # STEP 9: EXECUTE APPROVED RECIPE
+      - name: Execute approved unit test remediation
+        id: remediation
+        shell: bash
+        env:
+          SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+
+        run: |
+          set -euo pipefail
+
+          echo "Executing approved deterministic remediation."
+          echo "Recipe: frontend_title_mismatch_v1"
+          echo "Source branch: $SOURCE_BRANCH"
+          echo "Source SHA: $SOURCE_SHA"
+
+          mkdir -p source/reports
+
+          set +e
+
+          python -m cicd_recovery.remediation \
+            --project-root "$GITHUB_WORKSPACE/source" \
+            --approve \
+            > "$GITHUB_WORKSPACE/remediation-execution.log" 2>&1
+
+          EXIT_CODE=$?
+
+          set -e
+
+          cat "$GITHUB_WORKSPACE/remediation-execution.log"
+
+          AUDIT=$(find source/reports -maxdepth 1 \
+            -name 'remediation-frontend_title_mismatch_v1-*.json' \
+            -type f | sort | tail -n 1 || true)
+
+          if [[ -n "$AUDIT" ]]; then
+            STATUS=$(jq -r '.status // "unknown"' "$AUDIT")
+
+            {
+              echo ""
+              echo "## Remediation execution result"
+              echo ""
+              echo "- Recipe: frontend_title_mismatch_v1"
+              echo "- Result: $STATUS"
+              echo "- Source branch: $SOURCE_BRANCH"
+              echo "- Source SHA: $SOURCE_SHA"
+              echo "- Commit: Not performed"
+              echo "- Push: Not performed"
+              echo "- CI retry: Not performed"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo ""
+              echo "## Remediation execution failed"
+              echo ""
+              echo "No audit report was generated. Check the execution log."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [[ "$EXIT_CODE" -ne 0 ]]; then
+            echo "::error::Remediation or validation failed. No commit or retry will be performed."
+            exit "$EXIT_CODE"
+          fi
+
+      # STEP 10: UPLOAD REMEDIATION AUDIT
+      - name: Upload remediation audit and execution log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: remediation-result-${{ needs.diagnose.outputs.source_run_id }}
+          path: |
+            source/reports/*.json
+            remediation-execution.log
+          if-no-files-found: warn
+          retention-days: 14
