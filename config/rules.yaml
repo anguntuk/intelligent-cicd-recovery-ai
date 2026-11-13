@@ -114,12 +114,12 @@ rules:
       approval_required: true
       max_attempts: 1
 
-    validation:
-      - npm test
-      - npm run build
-      
-    target_branch: originating_feature_branch
-    commit_only_after_validation: true
+      validation:
+        - npm test
+        - npm run build
+
+      target_branch: originating_feature_branch
+      commit_only_after_validation: true
 
   - id: frontend_build_failure
     category: frontend_build_failure
