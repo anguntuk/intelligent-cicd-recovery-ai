@@ -617,6 +617,36 @@ If either approval is rejected or expires:
 
 Approval is enforced by GitHub Environment protection rules; the watchdog provides a separate deadline and audit check. Keep the required-reviewer configuration in place even though the workflow also checks the approval-history API.
 
+### Approval scenario matrix
+
+The following table describes the expected behavior for the important approval and handoff scenarios. The first and second approval windows are independent. Each window begins at its own clock job; the second clock does not start until patch review succeeds.
+
+| Scenario | First approval gate | Second approval gate | Expected workflow behavior |
+|---|---|---|---|
+| Correct first approval arrives before the deadline | GitHub records `approved` for `remediation-approval` | Not requested yet | First watchdog succeeds; remediation and validation may proceed. |
+| First approval is rejected | GitHub records `rejected` for `remediation-approval` | Never requested | First watchdog requests cancellation. Remediation, patch review, commit, and push do not proceed. |
+| No first approval arrives before the deadline | No approved record appears before the configured deadline | Never requested | First watchdog requests cancellation when the deadline expires. No remediation or commit is performed. |
+| First environment starts without a verifiable approval record | Environment job becomes active/completes but no matching approval-history record is found | Never requested | Watchdog treats this as an environment/protection-rule configuration problem and cancels after its 60-second detection window. A job starting is not itself proof of approval. |
+| First approval is granted, but remediation or validation fails | First gate is approved | Never requested | Executor records the failure and attempts rollback. Patch handoff and commit are blocked. |
+| Patch review fails or the handoff is invalid | First gate is already approved | Never requested | Second clock and second approval are not started. Commit and push are blocked. |
+| First approval is granted and patch review succeeds | First gate is approved | A new, separate request is created for `remediation-commit-approval` | The second clock starts at this stage. The first approval does not satisfy or pre-approve the second gate. |
+| Second approval is rejected | First gate remains approved | GitHub records `rejected` for `remediation-commit-approval` | Second watchdog requests cancellation. Commit and push do not proceed. |
+| No second approval arrives before its deadline | First gate remains approved | No approved record appears before the second deadline | Second watchdog requests cancellation. Commit and push do not proceed. |
+| Second environment starts without a verifiable approval record | First gate must still be recorded as approved | Second environment job has no matching approval-history record | Second watchdog fails closed and cancels after its 60-second configuration-detection window. |
+| Second approval is granted, but the feature branch has advanced | First gate approved | Second gate independently approved | Commit job detects that the branch SHA differs from the diagnosed source SHA and stops. A new diagnosis, patch review, and approval cycle is required. |
+| Both approvals pass and the source SHA is unchanged | First gate approved | Second gate approved | The exact reviewed patch can be verified, staged, committed, and pushed to the originating feature branch. |
+| Post-push Frontend CI fails | Both approvals have already passed | Both approvals have already passed | The commit remains pushed. The CI failure is recorded for human investigation; no automatic rollback or repeat remediation is triggered. |
+
+### How to read the approval jobs in the Actions graph
+
+Each approval stage has three related jobs: a clock job, an environment-protected human approval job, and a deadline watchdog. The clock records the start time. The environment job pauses while GitHub waits for a required reviewer. The watchdog polls GitHub's approval history and the environment job state while the approval is pending.
+
+The watchdog is not a second reviewer and does not grant approval. It either confirms the independently recorded approval, detects rejection, or enforces the deadline. When the reviewer approves in time, the watchdog exits successfully; when the deadline expires or the environment is misconfigured, it requests workflow cancellation. A skipped watchdog/approval job in a particular run can be normal when its prerequisite condition was not met; inspect the job's `if` condition and dependency results before interpreting the graph icon.
+
+### Timeout scope
+
+`APPROVAL_TIMEOUT_MINUTES` applies only to the two human approval windows. It does not set a 30-minute runtime limit on diagnosis, remediation, patch review, commit/push, or post-push CI. Those jobs have no project-specific `timeout-minutes` value in the current workflow. GitHub's own runner and workflow maximum-duration limits still apply. Separately, the remediation executor has a 600-second timeout on each validation subprocess (`npm test` and `npm run build`); this protects an individual command from hanging and is not an approval or whole-job timeout.
+
 ---
 
 ## Remediation recipe and safety controls
