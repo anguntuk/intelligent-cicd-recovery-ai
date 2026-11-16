@@ -1378,9 +1378,10 @@ jobs:
         run: |
           set -euo pipefail
 
-          # The workflows list is based on workflows available from the
-          # default branch. Frontend CI must have workflow_dispatch there.
+          # Workflow dispatch requires the workflow to exist on the default
+          # branch, but the selected ref controls which branch is executed.
           WORKFLOWS=$(gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
             "repos/${REPOSITORY}/actions/workflows?per_page=100")
 
           MATCHING_WORKFLOWS=$(jq -c '
@@ -1398,7 +1399,6 @@ jobs:
               commit-result.json > commit-result.tmp
             mv commit-result.tmp commit-result.json
             echo "::error::Expected exactly one active 'Frontend CI' workflow on the default branch; found $MATCH_COUNT."
-            echo "Confirm that Frontend CI with workflow_dispatch exists on the default branch."
             exit 1
           fi
 
@@ -1407,33 +1407,101 @@ jobs:
 
           echo "Frontend CI workflow ID: $WORKFLOW_ID"
           echo "Frontend CI workflow path: $WORKFLOW_PATH"
+          echo "Target branch: $SOURCE_BRANCH"
+          echo "Target commit: $COMMIT_SHA"
 
-          DISPATCH_BODY=$(jq -n --arg ref "$SOURCE_BRANCH" '{ref: $ref}')
+          # Capture the dispatch start time so the fallback does not mistake
+          # an older manual run on the same SHA for this dispatch.
+          DISPATCH_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          if ! DISPATCH_RESPONSE=$(printf '%s' "$DISPATCH_BODY" | gh api \
+          DISPATCH_BODY=$(jq -n \
+            --arg ref "$SOURCE_BRANCH" \
+            '{ref: $ref, return_run_details: true}')
+
+          DISPATCH_RESPONSE=""
+          DISPATCH_EXIT_CODE=0
+
+          set +e
+          DISPATCH_RESPONSE=$(printf '%s' "$DISPATCH_BODY" | gh api \
             --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
             "repos/${REPOSITORY}/actions/workflows/${WORKFLOW_ID}/dispatches" \
-            --input -); then
+            --input - 2>&1)
+          DISPATCH_EXIT_CODE=$?
+          set -e
 
-            jq '.status = "pushed_ci_dispatch_failed"
-                | .post_push_ci.status = "dispatch_api_error"' \
-              commit-result.json > commit-result.tmp
-            mv commit-result.tmp commit-result.json
-            echo "::error::GitHub rejected the Frontend CI workflow_dispatch request."
-            exit 1
+          if [[ "$DISPATCH_EXIT_CODE" -ne 0 ]]; then
+            echo "Dispatch call returned a non-zero exit code; checking whether GitHub accepted it."
+            echo "$DISPATCH_RESPONSE"
           fi
 
-          # GitHub's current dispatch API returns the created workflow run ID.
-          DISPATCH_RUN_ID=$(jq -r '.workflow_run_id // empty' <<< "$DISPATCH_RESPONSE")
-          DISPATCH_RUN_URL=$(jq -r '.html_url // .run_url // empty' <<< "$DISPATCH_RESPONSE")
+          # Preferred path: use the run ID returned by GitHub when the
+          # return_run_details option is supported by the API response.
+          DISPATCH_RUN_ID=""
+          DISPATCH_RUN_URL=""
+
+          if [[ -n "$DISPATCH_RESPONSE" ]] && jq -e . >/dev/null 2>&1 <<< "$DISPATCH_RESPONSE"; then
+            DISPATCH_RUN_ID=$(jq -r '.workflow_run_id // empty' <<< "$DISPATCH_RESPONSE")
+            DISPATCH_RUN_URL=$(jq -r '.html_url // .run_url // empty' <<< "$DISPATCH_RESPONSE")
+          fi
+
+          # Fallback: an accepted dispatch can still return an empty body
+          # (HTTP 204). Discover the run by exact workflow, event, branch,
+          # commit SHA, and creation time instead of failing on a blank body.
+          if [[ ! "$DISPATCH_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "No workflow_run_id in dispatch response; searching for the exact dispatched run."
+
+            for attempt in $(seq 1 60); do
+              echo "Looking for dispatched Frontend CI run (attempt $attempt/60)..."
+
+              RUN_LIST=$(gh api \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                --method GET \
+                "repos/${REPOSITORY}/actions/workflows/${WORKFLOW_ID}/runs" \
+                -f branch="$SOURCE_BRANCH" \
+                -f event=workflow_dispatch \
+                -f head_sha="$COMMIT_SHA" \
+                -F per_page=100)
+
+              MATCHING_RUN=$(jq -c \
+                --arg workflow_id "$WORKFLOW_ID" \
+                --arg branch "$SOURCE_BRANCH" \
+                --arg sha "$COMMIT_SHA" \
+                --arg started_at "$DISPATCH_STARTED_AT" '
+                  [
+                    .workflow_runs[]?
+                    | select(
+                        ((.workflow_id | tostring) == $workflow_id)
+                        and .event == "workflow_dispatch"
+                        and .head_branch == $branch
+                        and .head_sha == $sha
+                        and (.created_at // "") >= $started_at
+                      )
+                  ]
+                  | sort_by(.created_at)
+                  | last // empty
+                ' <<< "$RUN_LIST")
+
+              if [[ -n "$MATCHING_RUN" ]]; then
+                DISPATCH_RUN_ID=$(jq -r '.id | tostring' <<< "$MATCHING_RUN")
+                DISPATCH_RUN_URL=$(jq -r '.html_url // empty' <<< "$MATCHING_RUN")
+                break
+              fi
+
+              sleep 5
+            done
+          fi
 
           if [[ ! "$DISPATCH_RUN_ID" =~ ^[0-9]+$ ]]; then
             jq '.status = "pushed_ci_dispatch_failed"
-                | .post_push_ci.status = "dispatch_response_missing_run_id"' \
+                | .post_push_ci.status = "dispatch_accepted_but_run_not_found"' \
               commit-result.json > commit-result.tmp
             mv commit-result.tmp commit-result.json
-            echo "::error::Dispatch API did not return a valid workflow_run_id."
-            echo "Response: $DISPATCH_RESPONSE"
+
+            echo "::error::Could not identify the dispatched Frontend CI run."
+            echo "Dispatch API exit code: $DISPATCH_EXIT_CODE"
+            echo "Dispatch response: $DISPATCH_RESPONSE"
             exit 1
           fi
 
@@ -1466,6 +1534,7 @@ jobs:
             echo "- Ref: $SOURCE_BRANCH"
             echo "- Commit SHA: \`$COMMIT_SHA\`"
             echo "- Event: workflow_dispatch"
+            echo "- Dispatch API response: $([[ -n "$DISPATCH_RESPONSE" ]] && echo "with body" || echo "empty; run found by API query")"
           } >> "$GITHUB_STEP_SUMMARY"
 
       # STEP 9: WAIT FOR THE EXACT DISPATCHED RUN
