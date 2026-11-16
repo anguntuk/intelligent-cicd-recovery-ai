@@ -1408,7 +1408,12 @@ jobs:
           echo "Frontend CI workflow ID: $WORKFLOW_ID"
           echo "Frontend CI workflow path: $WORKFLOW_PATH"
 
-          DISPATCH_BODY=$(jq -n --arg ref "$SOURCE_BRANCH" '{ref: $ref}')
+          # Ask GitHub to return workflow_run_id and run URLs in the
+          # dispatch response. Without this option the API returns HTTP 204
+          # with an empty response body.
+          DISPATCH_BODY=$(jq -n \
+            --arg ref "$SOURCE_BRANCH" \
+            '{ref: $ref, return_run_details: true}')
 
           if ! DISPATCH_RESPONSE=$(printf '%s' "$DISPATCH_BODY" | gh api \
             --method POST \
@@ -1423,7 +1428,8 @@ jobs:
             exit 1
           fi
 
-          # GitHub's current dispatch API returns the created workflow run ID.
+          # return_run_details=true makes the dispatch API return the
+          # created workflow run ID and URLs (HTTP 200 with JSON).
           DISPATCH_RUN_ID=$(jq -r '.workflow_run_id // empty' <<< "$DISPATCH_RESPONSE")
           DISPATCH_RUN_URL=$(jq -r '.html_url // .run_url // empty' <<< "$DISPATCH_RESPONSE")
 
