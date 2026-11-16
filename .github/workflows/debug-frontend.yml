@@ -24,8 +24,6 @@ jobs:
   diagnose:
     name: Frontend CI Result and Failure Diagnosis
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
     outputs:
       approval_required: ${{ steps.approval.outputs.required }}
       supported_recipe: ${{ steps.approval.outputs.supported_recipe }}
@@ -70,9 +68,10 @@ jobs:
 
           # Frontend CI and this diagnostic workflow are triggered
           # by the same push. Wait until the matching CI run completes.
-          for attempt in $(seq 1 180); do
+          # No project-specific timeout is imposed on this phase.
+          while true; do
 
-            echo "Checking Frontend CI status (attempt $attempt/180)..."
+            echo "Checking Frontend CI status..."
 
             RUN_LIST=$(gh api \
               --method GET \
@@ -113,11 +112,6 @@ jobs:
 
             sleep 10
           done
-
-          if [[ -z "$RUN_DATA" ]]; then
-            echo "::error::Timed out waiting for Frontend CI to complete for commit $PUSH_SHA."
-            exit 1
-          fi
 
           WORKFLOW_NAME=$(jq -r '.name // ""' <<< "$RUN_DATA")
           BRANCH=$(jq -r '.head_branch // ""' <<< "$RUN_DATA")
@@ -378,12 +372,41 @@ jobs:
 
 
   # ==================================================
+  # JOB 2: START FIRST APPROVAL WINDOW
+  # ==================================================
+  first-approval-clock:
+    name: Start First Approval Window
+    needs: diagnose
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+    runs-on: ubuntu-latest
+    outputs:
+      started_at_epoch: ${{ steps.clock.outputs.started_at_epoch }}
+    permissions:
+      contents: read
+    steps:
+      - name: Record first approval request start
+        id: clock
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "started_at_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "First approval window started at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+
+
+  # ==================================================
   # JOB 2: FIRST HUMAN APPROVAL
   # ==================================================
   remediation-approval:
     name: Human Approval for Remediation Proposal
 
-    needs: diagnose
+    needs:
+      - diagnose
+      - first-approval-clock
 
     if: >-
       ${{
@@ -393,8 +416,6 @@ jobs:
       }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     permissions:
       contents: read
 
@@ -408,16 +429,174 @@ jobs:
           set -euo pipefail
 
           {
-            echo "## Human approval received"
+            echo "## First approval gate passed"
             echo ""
-            echo "- Approval mechanism: GitHub Environment"
+            echo "- Approval mechanism: GitHub Environment required reviewers"
             echo "- Environment: remediation-approval"
-            echo "- Reviewer approval: Granted"
+            echo "- Environment protection: Passed"
             echo "- Remediation execution: Authorized"
             echo "- Recipe: frontend_title_mismatch_v2"
             echo "- Commit/push: Not performed"
             echo "- CI retry: Not performed"
           } >> "$GITHUB_STEP_SUMMARY"
+
+
+  # ==================================================
+  # JOB 2A: FIRST APPROVAL DEADLINE WATCHDOG
+  # ==================================================
+  first-approval-watchdog:
+    name: Enforce First Approval Deadline
+    needs:
+      - diagnose
+      - first-approval-clock
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Enforce first approval deadline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ENVIRONMENT_NAME: remediation-approval
+          APPROVAL_JOB_NAME: Human Approval for Remediation Proposal
+          APPROVAL_STARTED_AT: ${{ needs.first-approval-clock.outputs.started_at_epoch }}
+          APPROVAL_TIMEOUT_MINUTES: ${{ vars.APPROVAL_TIMEOUT_MINUTES || '30' }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$APPROVAL_TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] \
+            || (( APPROVAL_TIMEOUT_MINUTES > 350 )); then
+            echo "::error::APPROVAL_TIMEOUT_MINUTES must be an integer from 1 to 350."
+            exit 1
+          fi
+
+          if [[ ! "$APPROVAL_STARTED_AT" =~ ^[0-9]+$ ]]; then
+            echo "::error::Approval start timestamp is missing or invalid."
+            exit 1
+          fi
+
+          MAX_WAIT_SECONDS=$((APPROVAL_TIMEOUT_MINUTES * 60))
+          MISCONFIGURED_GATE_STARTED_AT=""
+
+          cancel_workflow() {
+            local reason="$1"
+            {
+              echo ""
+              echo "## First approval gate cancelled"
+              echo ""
+              echo "$reason"
+              echo "Remediation will not execute."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            gh api --method POST \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/cancel" >/dev/null
+          }
+
+          echo "Monitoring environment approval: $ENVIRONMENT_NAME"
+          echo "Approval deadline: ${APPROVAL_TIMEOUT_MINUTES} minutes"
+
+          while true; do
+            # This endpoint records the actual reviewer decision and the
+            # environment to which that decision applies. A job starting
+            # without an approval record is not treated as approved.
+            APPROVALS=$(gh api \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/approvals")
+
+            REVIEW=$(jq -c --arg env "$ENVIRONMENT_NAME" '
+              [
+                .[]?
+                | select(
+                    any(
+                      .environments[]?;
+                      ((.name // "") | ascii_downcase) == ($env | ascii_downcase)
+                    )
+                  )
+              ]
+              | last // empty
+            ' <<< "$APPROVALS")
+
+            if [[ -n "$REVIEW" ]]; then
+              REVIEW_STATE=$(jq -r '.state // "unknown"' <<< "$REVIEW")
+              REVIEWER=$(jq -r '.user.login // "unknown"' <<< "$REVIEW")
+
+              if [[ "$REVIEW_STATE" == "approved" ]]; then
+                {
+                  echo "## First approval verified"
+                  echo ""
+                  echo "- Environment: $ENVIRONMENT_NAME"
+                  echo "- Reviewer: $REVIEWER"
+                  echo "- Approval recorded by GitHub: Yes"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+
+              if [[ "$REVIEW_STATE" == "rejected" ]]; then
+                cancel_workflow "The first approval for '$ENVIRONMENT_NAME' was rejected by $REVIEWER."
+                echo "::error::First approval was rejected."
+                exit 1
+              fi
+            fi
+
+            JOBS=$(gh api \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
+              -F per_page=100)
+
+            APPROVAL_JOB=$(jq -c --arg name "$APPROVAL_JOB_NAME" '
+              [.jobs[]? | select(.name == $name)] | last // empty
+            ' <<< "$JOBS")
+
+            JOB_STATUS="not_found"
+            JOB_CONCLUSION=""
+            if [[ -n "$APPROVAL_JOB" ]]; then
+              JOB_STATUS=$(jq -r '.status // "unknown"' <<< "$APPROVAL_JOB")
+              JOB_CONCLUSION=$(jq -r '.conclusion // ""' <<< "$APPROVAL_JOB")
+            fi
+
+            if [[ "$JOB_STATUS" == "completed" && "$JOB_CONCLUSION" != "success" ]]; then
+              echo "::error::First approval job finished without a successful approval: $JOB_CONCLUSION"
+              exit 1
+            fi
+
+            # If the environment job has started or completed successfully
+            # but GitHub has no approval record for this environment, fail
+            # closed. This catches an environment missing required reviewers.
+            if [[ "$JOB_STATUS" == "in_progress" \
+              || ( "$JOB_STATUS" == "completed" && "$JOB_CONCLUSION" == "success" ) ]]; then
+              if [[ -z "$MISCONFIGURED_GATE_STARTED_AT" ]]; then
+                MISCONFIGURED_GATE_STARTED_AT=$(date +%s)
+              fi
+
+              MISCONFIGURED_ELAPSED=$(( $(date +%s) - MISCONFIGURED_GATE_STARTED_AT ))
+              if (( MISCONFIGURED_ELAPSED >= 60 )); then
+                cancel_workflow "The environment job started without a GitHub approval-history record. Verify required reviewers on '$ENVIRONMENT_NAME'."
+                echo "::error::Environment approval could not be verified; workflow cancelled."
+                exit 1
+              fi
+            else
+              MISCONFIGURED_GATE_STARTED_AT=""
+            fi
+
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - APPROVAL_STARTED_AT))
+            REMAINING=$((MAX_WAIT_SECONDS - ELAPSED))
+            echo "First approval elapsed: ${ELAPSED}s; remaining: ${REMAINING}s; gate job status: $JOB_STATUS"
+
+            if (( ELAPSED >= MAX_WAIT_SECONDS )); then
+              cancel_workflow "No approved review record was received for '$ENVIRONMENT_NAME' within ${APPROVAL_TIMEOUT_MINUTES} minutes."
+              echo "::error::First approval deadline expired."
+              exit 1
+            fi
+
+            sleep 15
+          done
 
 
   # ==================================================
@@ -429,17 +608,17 @@ jobs:
     needs:
       - diagnose
       - remediation-approval
+      - first-approval-watchdog
 
     if: >-
       ${{
         needs.diagnose.result == 'success'
         && needs.remediation-approval.result == 'success'
+        && needs.first-approval-watchdog.result == 'success'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     permissions:
       contents: read
       actions: read
@@ -842,8 +1021,6 @@ jobs:
       }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-
     permissions:
       contents: read
       actions: read
@@ -983,6 +1160,35 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
     # ==================================================
+  # JOB 5: START SECOND APPROVAL WINDOW
+  # ==================================================
+  second-approval-clock:
+    name: Start Second Approval Window
+    needs:
+      - diagnose
+      - remediation-review
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+    runs-on: ubuntu-latest
+    outputs:
+      started_at_epoch: ${{ steps.clock.outputs.started_at_epoch }}
+    permissions:
+      contents: read
+    steps:
+      - name: Record second approval request start
+        id: clock
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "started_at_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "Second approval window started at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+
+
+  # ==================================================
   # JOB 5: SECOND HUMAN APPROVAL FOR COMMIT
   # ==================================================
   commit-approval:
@@ -991,6 +1197,7 @@ jobs:
     needs:
       - diagnose
       - remediation-review
+      - second-approval-clock
 
     if: >-
       ${{
@@ -1000,8 +1207,6 @@ jobs:
       }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     permissions:
       contents: read
 
@@ -1016,18 +1221,198 @@ jobs:
           set -euo pipefail
 
           {
-            echo "## Second human approval received"
+            echo "## Second approval gate passed"
             echo ""
-            echo "- Approval mechanism: GitHub Environment"
+            echo "- Approval mechanism: GitHub Environment required reviewers"
             echo "- Environment: remediation-commit-approval"
+            echo "- Environment protection: Passed"
             echo "- Patch review job: Successful"
-            echo "- Validated patch: Approved for commit"
+            echo "- Validated patch: Authorized for commit"
             echo "- Target: Originating feature branch"
             echo "- Force push: Not allowed"
             echo "- CI retry API: Not used"
           } >> "$GITHUB_STEP_SUMMARY"
 
     # ==================================================
+  # JOB 5A: SECOND APPROVAL DEADLINE WATCHDOG
+  # ==================================================
+  second-approval-watchdog:
+    name: Enforce Second Approval Deadline
+    needs:
+      - diagnose
+      - remediation-review
+      - second-approval-clock
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Enforce second approval deadline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ENVIRONMENT_NAME: remediation-commit-approval
+          APPROVAL_JOB_NAME: Second Human Approval - Commit Validated Remediation
+          APPROVAL_STARTED_AT: ${{ needs.second-approval-clock.outputs.started_at_epoch }}
+          APPROVAL_TIMEOUT_MINUTES: ${{ vars.APPROVAL_TIMEOUT_MINUTES || '30' }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$APPROVAL_TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] \
+            || (( APPROVAL_TIMEOUT_MINUTES > 350 )); then
+            echo "::error::APPROVAL_TIMEOUT_MINUTES must be an integer from 1 to 350."
+            exit 1
+          fi
+
+          if [[ ! "$APPROVAL_STARTED_AT" =~ ^[0-9]+$ ]]; then
+            echo "::error::Approval start timestamp is missing or invalid."
+            exit 1
+          fi
+
+          MAX_WAIT_SECONDS=$((APPROVAL_TIMEOUT_MINUTES * 60))
+          MISCONFIGURED_GATE_STARTED_AT=""
+
+          cancel_workflow() {
+            local reason="$1"
+            {
+              echo ""
+              echo "## Second approval gate cancelled"
+              echo ""
+              echo "$reason"
+              echo "Commit and push will not execute."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            gh api --method POST \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/cancel" >/dev/null
+          }
+
+          echo "Monitoring environment approval: $ENVIRONMENT_NAME"
+          echo "Approval deadline: ${APPROVAL_TIMEOUT_MINUTES} minutes"
+
+          while true; do
+            APPROVALS=$(gh api \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/approvals")
+
+            # Verify that the first, distinct environment approval remains
+            # recorded before considering the second approval.
+            FIRST_REVIEW=$(jq -c '
+              [
+                .[]?
+                | select(
+                    any(
+                      .environments[]?;
+                      ((.name // "") | ascii_downcase) == "remediation-approval"
+                    )
+                  )
+              ]
+              | last // empty
+            ' <<< "$APPROVALS")
+
+            FIRST_STATE=""
+            if [[ -n "$FIRST_REVIEW" ]]; then
+              FIRST_STATE=$(jq -r '.state // "unknown"' <<< "$FIRST_REVIEW")
+            fi
+
+            if [[ "$FIRST_STATE" != "approved" ]]; then
+              cancel_workflow "The first approval history is missing or not approved. The second gate cannot authorize a commit."
+              echo "::error::First approval is not recorded as approved."
+              exit 1
+            fi
+
+            SECOND_REVIEW=$(jq -c --arg env "$ENVIRONMENT_NAME" '
+              [
+                .[]?
+                | select(
+                    any(
+                      .environments[]?;
+                      ((.name // "") | ascii_downcase) == ($env | ascii_downcase)
+                    )
+                  )
+              ]
+              | last // empty
+            ' <<< "$APPROVALS")
+
+            if [[ -n "$SECOND_REVIEW" ]]; then
+              REVIEW_STATE=$(jq -r '.state // "unknown"' <<< "$SECOND_REVIEW")
+              REVIEWER=$(jq -r '.user.login // "unknown"' <<< "$SECOND_REVIEW")
+
+              if [[ "$REVIEW_STATE" == "approved" ]]; then
+                {
+                  echo "## Second approval verified"
+                  echo ""
+                  echo "- Environment: $ENVIRONMENT_NAME"
+                  echo "- Reviewer: $REVIEWER"
+                  echo "- Approval recorded by GitHub: Yes"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+
+              if [[ "$REVIEW_STATE" == "rejected" ]]; then
+                cancel_workflow "The second approval for '$ENVIRONMENT_NAME' was rejected by $REVIEWER."
+                echo "::error::Second approval was rejected."
+                exit 1
+              fi
+            fi
+
+            JOBS=$(gh api \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
+              -F per_page=100)
+
+            APPROVAL_JOB=$(jq -c --arg name "$APPROVAL_JOB_NAME" '
+              [.jobs[]? | select(.name == $name)] | last // empty
+            ' <<< "$JOBS")
+
+            JOB_STATUS="not_found"
+            JOB_CONCLUSION=""
+            if [[ -n "$APPROVAL_JOB" ]]; then
+              JOB_STATUS=$(jq -r '.status // "unknown"' <<< "$APPROVAL_JOB")
+              JOB_CONCLUSION=$(jq -r '.conclusion // ""' <<< "$APPROVAL_JOB")
+            fi
+
+            if [[ "$JOB_STATUS" == "completed" && "$JOB_CONCLUSION" != "success" ]]; then
+              echo "::error::Second approval job finished without a successful approval: $JOB_CONCLUSION"
+              exit 1
+            fi
+
+            if [[ "$JOB_STATUS" == "in_progress" \
+              || ( "$JOB_STATUS" == "completed" && "$JOB_CONCLUSION" == "success" ) ]]; then
+              if [[ -z "$MISCONFIGURED_GATE_STARTED_AT" ]]; then
+                MISCONFIGURED_GATE_STARTED_AT=$(date +%s)
+              fi
+
+              MISCONFIGURED_ELAPSED=$(( $(date +%s) - MISCONFIGURED_GATE_STARTED_AT ))
+              if (( MISCONFIGURED_ELAPSED >= 60 )); then
+                cancel_workflow "The second environment job started without a GitHub approval-history record. Verify required reviewers on '$ENVIRONMENT_NAME'."
+                echo "::error::Second environment approval could not be verified; workflow cancelled."
+                exit 1
+              fi
+            else
+              MISCONFIGURED_GATE_STARTED_AT=""
+            fi
+
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - APPROVAL_STARTED_AT))
+            REMAINING=$((MAX_WAIT_SECONDS - ELAPSED))
+            echo "Second approval elapsed: ${ELAPSED}s; remaining: ${REMAINING}s; gate job status: $JOB_STATUS"
+
+            if (( ELAPSED >= MAX_WAIT_SECONDS )); then
+              cancel_workflow "No approved review record was received for '$ENVIRONMENT_NAME' within ${APPROVAL_TIMEOUT_MINUTES} minutes."
+              echo "::error::Second approval deadline expired."
+              exit 1
+            fi
+
+            sleep 15
+          done
+
+
+  # ==================================================
   # JOB 6: COMMIT AND PUSH AFTER SECOND APPROVAL
   # ==================================================
   commit-push:
@@ -1037,18 +1422,18 @@ jobs:
       - diagnose
       - remediation-review
       - commit-approval
+      - second-approval-watchdog
 
     if: >-
       ${{
         needs.diagnose.result == 'success'
         && needs.remediation-review.result == 'success'
         && needs.commit-approval.result == 'success'
+        && needs.second-approval-watchdog.result == 'success'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 55
-
     # Only this post-approval job can push and explicitly dispatch Frontend CI.
     permissions:
       contents: write
@@ -1452,8 +1837,8 @@ jobs:
           if [[ ! "$DISPATCH_RUN_ID" =~ ^[0-9]+$ ]]; then
             echo "No workflow_run_id in dispatch response; searching for the exact dispatched run."
 
-            for attempt in $(seq 1 60); do
-              echo "Looking for dispatched Frontend CI run (attempt $attempt/60)..."
+            while true; do
+              echo "Looking for the dispatched Frontend CI run..."
 
               RUN_LIST=$(gh api \
                 -H "X-GitHub-Api-Version: 2026-03-10" \
@@ -1556,8 +1941,10 @@ jobs:
 
           RUN_DATA=""
 
-          for attempt in $(seq 1 180); do
-            echo "Waiting for Frontend CI run $DISPATCH_RUN_ID (attempt $attempt/180)..."
+          # Wait for the exact dispatched run to complete. No additional
+          # project-specific timeout is imposed on CI execution.
+          while true; do
+            echo "Waiting for Frontend CI run $DISPATCH_RUN_ID..."
 
             if ! RUN_DATA=$(gh api \
               "repos/${REPOSITORY}/actions/runs/${DISPATCH_RUN_ID}"); then
@@ -1575,29 +1962,6 @@ jobs:
 
             sleep 10
           done
-
-          if [[ -z "$RUN_DATA" ]] \
-            || [[ "$(jq -r '.status // ""' <<< "$RUN_DATA")" != "completed" ]]; then
-
-            jq '.status = "pushed_ci_not_found"
-                | .post_push_ci.status = "not_found_timeout"' \
-              commit-result.json > commit-result.tmp
-            mv commit-result.tmp commit-result.json
-
-            {
-              echo ""
-              echo "## Post-push Frontend CI verification timed out"
-              echo ""
-              echo "- Commit: \`$COMMIT_SHA\`"
-              echo "- Branch: $SOURCE_BRANCH"
-              echo "- Run ID: $DISPATCH_RUN_ID"
-              echo "- Waited: 30 minutes"
-              echo "- Commit and push remain completed; CI outcome is unknown."
-            } >> "$GITHUB_STEP_SUMMARY"
-
-            echo "::error::Frontend CI run $DISPATCH_RUN_ID did not complete within 30 minutes."
-            exit 1
-          fi
 
           # Bind the returned run to the exact workflow, ref and commit.
           jq -e \
