@@ -54,16 +54,16 @@ jobs:
 
       # TEMPORARY TEST ONLY: remove this step after validating the
       # unknown-failure triage route in debug-frontend.yml.
-      # It runs only for a push whose commit message contains the marker.
+      # It runs only for a push that includes the marker in any pushed commit message.
+      - name: Show unknown-failure test trigger context
+        shell: bash
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          echo "Ref: ${{ github.ref }}"
+          echo "Marker found in pushed commits: ${{ contains(toJSON(github.event.commits), '[simulate-unknown-failure]') }}"
+
       - name: Inject controlled unknown failure
-        if: >-
-          ${{
-            github.event_name == 'push'
-            && contains(
-              github.event.head_commit.message,
-              '[simulate-unknown-failure]'
-            )
-          }}
+        if: ${{ github.event_name == 'push' && contains(toJSON(github.event.commits), '[simulate-unknown-failure]') }}
         shell: bash
         run: |
           set -euo pipefail
