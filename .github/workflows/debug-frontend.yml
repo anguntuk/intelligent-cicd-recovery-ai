@@ -24,11 +24,11 @@ jobs:
   diagnose:
     name: Frontend CI Result and Failure Diagnosis
     runs-on: ubuntu-latest
-    timeout-minutes: 45
-
     outputs:
       approval_required: ${{ steps.approval.outputs.required }}
       supported_recipe: ${{ steps.approval.outputs.supported_recipe }}
+      verified_recipe: ${{ steps.approval.outputs.verified_recipe }}
+      unknown_failure: ${{ steps.approval.outputs.unknown_failure }}
       source_run_id: ${{ steps.gate.outputs.run_id }}
       source_sha: ${{ steps.gate.outputs.source_sha }}
       source_branch: ${{ steps.gate.outputs.source_branch }}
@@ -56,7 +56,6 @@ jobs:
           echo "Repository: $REPOSITORY"
           echo "Feature branch: $PUSH_BRANCH"
           echo "Pushed commit: $PUSH_SHA"
-
           if [[ "$PUSH_BRANCH" != feature/* ]]; then
             echo "::error::Only feature/* branches are allowed."
             exit 1
@@ -71,9 +70,10 @@ jobs:
 
           # Frontend CI and this diagnostic workflow are triggered
           # by the same push. Wait until the matching CI run completes.
-          for attempt in $(seq 1 180); do
+          # No project-specific timeout is imposed on this phase.
+          while true; do
 
-            echo "Checking Frontend CI status (attempt $attempt/180)..."
+            echo "Checking Frontend CI status..."
 
             RUN_LIST=$(gh api \
               --method GET \
@@ -114,11 +114,6 @@ jobs:
 
             sleep 10
           done
-
-          if [[ -z "$RUN_DATA" ]]; then
-            echo "::error::Timed out waiting for Frontend CI to complete for commit $PUSH_SHA."
-            exit 1
-          fi
 
           WORKFLOW_NAME=$(jq -r '.name // ""' <<< "$RUN_DATA")
           BRANCH=$(jq -r '.head_branch // ""' <<< "$RUN_DATA")
@@ -303,18 +298,22 @@ jobs:
 
           REPORT="${REPORTS[0]}"
 
+          UNKNOWN_FAILURE=$(jq -r '
+            (.routing.unknown_failure_present // false) == true
+            or any(.analyses[]?; .diagnosis.category == "unknown")
+          ' "$REPORT")
+
           APPROVAL_REQUIRED=$(jq -r '
             [
               .analyses[]?.diagnosis.remediation_plan?
               | select(
-                  .decision == "approval_required"
-                  and .eligible == true
+                  .eligible == true
                   and .requires_approval == true
                 )
             ] | length > 0
           ' "$REPORT")
 
-          SUPPORTED_RECIPE=$(jq -r '
+          VERIFIED_RECIPE=$(jq -r '
             (.analyses // []) as $analyses
             | if ($analyses | length) != 1 then
                 false
@@ -323,13 +322,46 @@ jobs:
                 | ($d.remediation_plan // {}) as $p
                 | (
                     $d.category == "unit_test_failure"
-                    and (
-                      ($d.matched_rule_ids // [])
-                      | index("unit_test_failure") != null
-                    )
-                    and $p.decision == "approval_required"
+                    and (($d.matched_rule_ids // []) | index("unit_test_failure") != null)
+                    and $p.verified == true
+                    and $p.decision == "verified_auto_execution"
                     and $p.eligible == true
-                    and $p.requires_approval == true
+                    and $p.requires_approval == false
+                  )
+              end
+          ' "$REPORT")
+
+          # Unknown or mixed unknown reports never enter either approval gate
+          # and can never use the verified-recipe bypass.
+          if [[ "$UNKNOWN_FAILURE" == "true" ]]; then
+            APPROVAL_REQUIRED="false"
+            VERIFIED_RECIPE="false"
+          fi
+
+          SUPPORTED_RECIPE=$(jq -r \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
+            (.analyses // []) as $analyses
+            | if ($analyses | length) != 1 then
+                false
+              else
+                ($analyses[0].diagnosis // {}) as $d
+                | ($d.remediation_plan // {}) as $p
+                | (
+                    $d.category == "unit_test_failure"
+                    and (($d.unknown_triage // null) == null)
+                    and (($d.matched_rule_ids // []) | index("unit_test_failure") != null)
+                    and $p.eligible == true
+                    and (
+                      ($verified_recipe == true
+                        and $p.verified == true
+                        and $p.decision == "verified_auto_execution"
+                        and $p.requires_approval == false)
+                      or
+                      ($verified_recipe == false
+                        and $p.verified == false
+                        and $p.decision == "approval_required"
+                        and $p.requires_approval == true)
+                    )
                     and (
                       ($analyses[0].sanitized_log_excerpt // "") as $excerpt
                       | (
@@ -345,16 +377,20 @@ jobs:
           EFFECTIVE_APPROVAL_REQUIRED="false"
 
           if [[ "$APPROVAL_REQUIRED" == "true" \
-            && "$SUPPORTED_RECIPE" == "true" ]]; then
+            && "$SUPPORTED_RECIPE" == "true" \
+            && "$VERIFIED_RECIPE" != "true" ]]; then
             EFFECTIVE_APPROVAL_REQUIRED="true"
           fi
 
           echo "Policy approval required: $APPROVAL_REQUIRED"
           echo "Supported recipe: $SUPPORTED_RECIPE"
+          echo "Manually verified recipe: $VERIFIED_RECIPE"
           echo "Effective approval required: $EFFECTIVE_APPROVAL_REQUIRED"
 
           echo "required=$EFFECTIVE_APPROVAL_REQUIRED" >> "$GITHUB_OUTPUT"
           echo "supported_recipe=$SUPPORTED_RECIPE" >> "$GITHUB_OUTPUT"
+          echo "verified_recipe=$VERIFIED_RECIPE" >> "$GITHUB_OUTPUT"
+          echo "unknown_failure=$UNKNOWN_FAILURE" >> "$GITHUB_OUTPUT"
 
           {
             echo ""
@@ -362,7 +398,16 @@ jobs:
             echo ""
             echo "- Policy approval required: $APPROVAL_REQUIRED"
             echo "- Supported recipe: $SUPPORTED_RECIPE"
+            echo "- Manually verified recipe: $VERIFIED_RECIPE"
             echo "- Effective approval required: $EFFECTIVE_APPROVAL_REQUIRED"
+            echo "- Unknown failure detected: $UNKNOWN_FAILURE"
+            if [[ "$UNKNOWN_FAILURE" == "true" ]]; then
+              echo "- Route: manual engineering investigation; no approval gate"
+              echo "- Remediation/commit/push/retry: prohibited for unknown failures"
+            elif [[ "$VERIFIED_RECIPE" == "true" ]]; then
+              echo "- Route: manually verified recipe; both approval gates and watchdogs are bypassed"
+              echo "- Execution validation, patch integrity checks, commit, push, and post-push CI remain required"
+            fi
             echo "- Recipe: frontend_title_mismatch_v2"
             echo "- AI: Disabled"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -379,23 +424,200 @@ jobs:
 
 
   # ==================================================
+  # JOB 1A: UNKNOWN FAILURE TRIAGE (NO APPROVAL)
+  # ==================================================
+  unknown-failure-triage:
+    name: Unknown Failure - Manual Engineering Triage (No Approval)
+    needs: diagnose
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.diagnose.outputs.unknown_failure == 'true'
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download diagnosis evidence
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-diagnosis-${{ needs.diagnose.outputs.source_run_id }}
+          path: diagnosis
+
+      - name: Create manual unknown-failure triage record
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+          SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t REPORTS < <(
+            find diagnosis -maxdepth 1 -type f -name '*.json' -print
+          )
+          if [[ "${#REPORTS[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one diagnosis report for unknown-failure triage."
+            exit 1
+          fi
+          REPORT="${REPORTS[0]}"
+
+          jq -e \
+            --arg repository "$REPOSITORY" \
+            --arg run_id "$SOURCE_RUN_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" '
+              .repository == $repository
+              and ((.workflow_run.id | tostring) == $run_id)
+              and .workflow_run.head_sha == $source_sha
+              and .workflow_run.head_branch == $source_branch
+              and (.analyses | length) > 0
+              and any(.analyses[]; .diagnosis.category == "unknown")
+              and .routing.unknown_failure_present == true
+              and .routing.unknown_failure_approval_gate == false
+              and .routing.unknown_failure_remediation_allowed == false
+              and all(
+                .analyses[] | select(.diagnosis.category == "unknown");
+                .diagnosis.remediation_plan.eligible == false
+                and .diagnosis.remediation_plan.requires_approval == false
+                and .diagnosis.unknown_triage.approval_required == false
+                and .diagnosis.unknown_triage.remediation_allowed == false
+                and .diagnosis.unknown_triage.commit_allowed == false
+                and .diagnosis.unknown_triage.push_allowed == false
+                and .diagnosis.unknown_triage.ci_retry_allowed == false
+              )
+            ' "$REPORT" > /dev/null
+
+          mkdir -p unknown-triage
+          cp "$REPORT" unknown-triage/diagnosis.json
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("unknown-triage/diagnosis.json").read_text(encoding="utf-8"))
+
+          def md(value):
+              text = str(value if value is not None else "not reported")
+              return (text.replace("`", "'")
+                          .replace("|", "/")
+                          .replace("<", "&lt;")
+                          .replace(">", "&gt;"))
+
+          run = report.get("workflow_run", {})
+          lines = [
+              "# Unknown CI/CD Failure - Manual Engineering Triage", "",
+              "> This incident did not match a configured deterministic rule.",
+              "> No approval was requested and no remediation action is permitted.", "",
+              "## Source context", "",
+              f"- Repository: `{md(report.get('repository'))}`",
+              f"- Workflow run: `{md(run.get('id'))}`",
+              f"- Run URL: {md(run.get('html_url'))}",
+              f"- Branch: `{md(run.get('head_branch'))}`",
+              f"- Source SHA: `{md(run.get('head_sha'))}`", "",
+              "## Findings", "",
+          ]
+          unknown = [a for a in report.get("analyses", [])
+                     if a.get("diagnosis", {}).get("category") == "unknown"]
+          for index, analysis in enumerate(unknown, 1):
+              diagnosis = analysis.get("diagnosis", {})
+              lines.extend([
+                  f"### Unknown failure {index}: {md(analysis.get('job_name'))}", "",
+                  f"- Failed job conclusion: `{md(analysis.get('job_conclusion'))}`",
+                  f"- Matched rules: none",
+                  f"- Failed steps: {md(', '.join(s.get('name', 'unnamed') for s in analysis.get('failed_steps', [])) or 'not reported')}",
+                  f"- Route: `manual_engineering_investigation`",
+                  f"- Human approval: **not requested**",
+                  f"- Remediation / commit / push / CI retry: **not permitted**", "",
+                  "#### Deterministic investigation checklist", "",
+              ])
+              triage = diagnosis.get("unknown_triage") or {}
+              for action in triage.get("recommended_actions", []):
+                  lines.append(f"- {md(action)}")
+              lines.extend(["", "#### Sanitized log excerpt", ""])
+              excerpt = analysis.get("sanitized_log_excerpt", "")
+              if excerpt:
+                  for line in excerpt.splitlines():
+                      lines.append(f"> {md(line)}")
+              else:
+                  lines.append("> No sanitized log excerpt was available.")
+              lines.append("")
+
+          lines.extend([
+              "## Required next step", "",
+              "An engineer must investigate the evidence, establish the root cause, and add a "
+              "reviewed rule plus regression fixture if the pattern is reusable. This triage "
+              "record does not authorize code changes or a retry.", "",
+          ])
+          output = "\n".join(lines)
+          Path("unknown-triage/triage-summary.md").write_text(output, encoding="utf-8")
+          summary_path = Path("unknown-triage/triage-summary.md")
+          with Path(__import__("os").environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as stream:
+              stream.write(output + "\n")
+          print(f"Created manual triage record for {len(unknown)} unknown failure(s).")
+          PY
+
+          echo "Unknown failure triage record created. No approval gate was entered."
+
+      - name: Upload unknown-failure triage package
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unknown-failure-triage-${{ needs.diagnose.outputs.source_run_id }}
+          path: unknown-triage/
+          if-no-files-found: error
+          retention-days: 30
+
+
+  # ==================================================
+  # JOB 2: START FIRST APPROVAL WINDOW
+  # ==================================================
+  first-approval-clock:
+    name: Start First Approval Window
+    needs: diagnose
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.unknown_failure != 'true'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+    runs-on: ubuntu-latest
+    outputs:
+      started_at_epoch: ${{ steps.clock.outputs.started_at_epoch }}
+    permissions:
+      contents: read
+    steps:
+      - name: Record first approval request start
+        id: clock
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "started_at_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "First approval window started at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+
+
+  # ==================================================
   # JOB 2: FIRST HUMAN APPROVAL
   # ==================================================
   remediation-approval:
     name: Human Approval for Remediation Proposal
 
-    needs: diagnose
+    needs:
+      - diagnose
+      - first-approval-clock
 
     if: >-
       ${{
         needs.diagnose.result == 'success'
         && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     permissions:
       contents: read
 
@@ -409,11 +631,11 @@ jobs:
           set -euo pipefail
 
           {
-            echo "## Human approval received"
+            echo "## First approval gate passed"
             echo ""
-            echo "- Approval mechanism: GitHub Environment"
+            echo "- Approval mechanism: GitHub Environment required reviewers"
             echo "- Environment: remediation-approval"
-            echo "- Reviewer approval: Granted"
+            echo "- Environment protection: Passed"
             echo "- Remediation execution: Authorized"
             echo "- Recipe: frontend_title_mismatch_v2"
             echo "- Commit/push: Not performed"
@@ -422,25 +644,198 @@ jobs:
 
 
   # ==================================================
-  # JOB 3: APPROVED DETERMINISTIC REMEDIATION
+  # JOB 2A: FIRST APPROVAL DEADLINE WATCHDOG
+  # ==================================================
+  first-approval-watchdog:
+    name: Enforce First Approval Deadline
+    needs:
+      - diagnose
+      - first-approval-clock
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.unknown_failure != 'true'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Enforce first approval deadline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ENVIRONMENT_NAME: remediation-approval
+          APPROVAL_JOB_NAME: Human Approval for Remediation Proposal
+          APPROVAL_STARTED_AT: ${{ needs.first-approval-clock.outputs.started_at_epoch }}
+          APPROVAL_TIMEOUT_MINUTES: ${{ vars.APPROVAL_TIMEOUT_MINUTES || '30' }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$APPROVAL_TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] \
+            || (( APPROVAL_TIMEOUT_MINUTES > 350 )); then
+            echo "::error::APPROVAL_TIMEOUT_MINUTES must be an integer from 1 to 350."
+            exit 1
+          fi
+
+          if [[ ! "$APPROVAL_STARTED_AT" =~ ^[0-9]+$ ]]; then
+            echo "::error::Approval start timestamp is missing or invalid."
+            exit 1
+          fi
+
+          MAX_WAIT_SECONDS=$((APPROVAL_TIMEOUT_MINUTES * 60))
+          MISCONFIGURED_GATE_STARTED_AT=""
+
+          cancel_workflow() {
+            local reason="$1"
+            {
+              echo ""
+              echo "## First approval gate cancelled"
+              echo ""
+              echo "$reason"
+              echo "Remediation will not execute."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            gh api --method POST \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/cancel" >/dev/null
+          }
+
+          echo "Monitoring environment approval: $ENVIRONMENT_NAME"
+          echo "Approval deadline: ${APPROVAL_TIMEOUT_MINUTES} minutes"
+
+          while true; do
+            # This endpoint records the actual reviewer decision and the
+            # environment to which that decision applies. A job starting
+            # without an approval record is not treated as approved.
+            APPROVALS=$(gh api \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/approvals")
+
+            REVIEW=$(jq -c --arg env "$ENVIRONMENT_NAME" '
+              [
+                .[]?
+                | select(
+                    any(
+                      .environments[]?;
+                      ((.name // "") | ascii_downcase) == ($env | ascii_downcase)
+                    )
+                  )
+              ]
+              | last // empty
+            ' <<< "$APPROVALS")
+
+            if [[ -n "$REVIEW" ]]; then
+              REVIEW_STATE=$(jq -r '.state // "unknown"' <<< "$REVIEW")
+              REVIEWER=$(jq -r '.user.login // "unknown"' <<< "$REVIEW")
+
+              if [[ "$REVIEW_STATE" == "approved" ]]; then
+                {
+                  echo "## First approval verified"
+                  echo ""
+                  echo "- Environment: $ENVIRONMENT_NAME"
+                  echo "- Reviewer: $REVIEWER"
+                  echo "- Approval recorded by GitHub: Yes"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+
+              if [[ "$REVIEW_STATE" == "rejected" ]]; then
+                cancel_workflow "The first approval for '$ENVIRONMENT_NAME' was rejected by $REVIEWER."
+                echo "::error::First approval was rejected."
+                exit 1
+              fi
+            fi
+
+            JOBS=$(gh api \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
+              -F per_page=100)
+
+            APPROVAL_JOB=$(jq -c --arg name "$APPROVAL_JOB_NAME" '
+              [.jobs[]? | select(.name == $name)] | last // empty
+            ' <<< "$JOBS")
+
+            JOB_STATUS="not_found"
+            JOB_CONCLUSION=""
+            if [[ -n "$APPROVAL_JOB" ]]; then
+              JOB_STATUS=$(jq -r '.status // "unknown"' <<< "$APPROVAL_JOB")
+              JOB_CONCLUSION=$(jq -r '.conclusion // ""' <<< "$APPROVAL_JOB")
+            fi
+
+            if [[ "$JOB_STATUS" == "completed" && "$JOB_CONCLUSION" != "success" ]]; then
+              echo "::error::First approval job finished without a successful approval: $JOB_CONCLUSION"
+              exit 1
+            fi
+
+            # If the environment job has started or completed successfully
+            # but GitHub has no approval record for this environment, fail
+            # closed. This catches an environment missing required reviewers.
+            if [[ "$JOB_STATUS" == "in_progress" \
+              || ( "$JOB_STATUS" == "completed" && "$JOB_CONCLUSION" == "success" ) ]]; then
+              if [[ -z "$MISCONFIGURED_GATE_STARTED_AT" ]]; then
+                MISCONFIGURED_GATE_STARTED_AT=$(date +%s)
+              fi
+
+              MISCONFIGURED_ELAPSED=$(( $(date +%s) - MISCONFIGURED_GATE_STARTED_AT ))
+              if (( MISCONFIGURED_ELAPSED >= 60 )); then
+                cancel_workflow "The environment job started without a GitHub approval-history record. Verify required reviewers on '$ENVIRONMENT_NAME'."
+                echo "::error::Environment approval could not be verified; workflow cancelled."
+                exit 1
+              fi
+            else
+              MISCONFIGURED_GATE_STARTED_AT=""
+            fi
+
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - APPROVAL_STARTED_AT))
+            REMAINING=$((MAX_WAIT_SECONDS - ELAPSED))
+            echo "First approval elapsed: ${ELAPSED}s; remaining: ${REMAINING}s; gate job status: $JOB_STATUS"
+
+            if (( ELAPSED >= MAX_WAIT_SECONDS )); then
+              cancel_workflow "No approved review record was received for '$ENVIRONMENT_NAME' within ${APPROVAL_TIMEOUT_MINUTES} minutes."
+              echo "::error::First approval deadline expired."
+              exit 1
+            fi
+
+            sleep 15
+          done
+
+
+  # ==================================================
+  # JOB 3: AUTHORIZED DETERMINISTIC REMEDIATION
   # ==================================================
   remediation-execution:
-    name: Execute Approved Remediation and Validate
+    name: Execute Authorized Remediation and Validate
 
     needs:
       - diagnose
       - remediation-approval
+      - first-approval-watchdog
 
     if: >-
       ${{
-        needs.diagnose.result == 'success'
-        && needs.remediation-approval.result == 'success'
+        always()
+        && needs.diagnose.result == 'success'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
+        && (
+          (
+            needs.diagnose.outputs.approval_required == 'true'
+            && needs.remediation-approval.result == 'success'
+            && needs.first-approval-watchdog.result == 'success'
+          )
+          ||
+          (
+            needs.diagnose.outputs.verified_recipe == 'true'
+            && needs.diagnose.outputs.approval_required == 'false'
+            && needs.remediation-approval.result == 'skipped'
+            && needs.first-approval-watchdog.result == 'skipped'
+          )
+        )
       }}
 
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
     permissions:
       contents: read
       actions: read
@@ -449,7 +844,7 @@ jobs:
 
       # STEP 1: DOWNLOAD DIAGNOSIS EVIDENCE
       - name: Download diagnosis report
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: frontend-diagnosis-${{ needs.diagnose.outputs.source_run_id }}
           path: diagnosis
@@ -482,6 +877,7 @@ jobs:
           SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
           SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
           SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          VERIFIED_RECIPE: ${{ needs.diagnose.outputs.verified_recipe }}
 
         run: |
           set -euo pipefail
@@ -505,7 +901,8 @@ jobs:
             --arg repo "$REPOSITORY" \
             --arg run "$SOURCE_RUN_ID" \
             --arg sha "$SOURCE_SHA" \
-            --arg branch "$SOURCE_BRANCH" '
+            --arg branch "$SOURCE_BRANCH" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
               .repository == $repo
               and ((.workflow_run.id | tostring) == $run)
               and .workflow_run.head_sha == $sha
@@ -516,9 +913,18 @@ jobs:
                 (.analyses[0].diagnosis.matched_rule_ids // [])
                 | index("unit_test_failure") != null
               )
-              and .analyses[0].diagnosis.remediation_plan.decision == "approval_required"
               and .analyses[0].diagnosis.remediation_plan.eligible == true
-              and .analyses[0].diagnosis.remediation_plan.requires_approval == true
+              and (
+                if $verified_recipe then
+                  .analyses[0].diagnosis.remediation_plan.verified == true
+                  and .analyses[0].diagnosis.remediation_plan.decision == "verified_auto_execution"
+                  and .analyses[0].diagnosis.remediation_plan.requires_approval == false
+                else
+                  .analyses[0].diagnosis.remediation_plan.verified == false
+                  and .analyses[0].diagnosis.remediation_plan.decision == "approval_required"
+                  and .analyses[0].diagnosis.remediation_plan.requires_approval == true
+                end
+              )
               and (
                 (.analyses[0].sanitized_log_excerpt // "") as $excerpt
                 | (
@@ -547,7 +953,7 @@ jobs:
           echo "Source branch: $SOURCE_BRANCH"
           echo "Source SHA: $SOURCE_SHA"
           echo "Controller SHA: $CONTROLLER_SHA"
-          echo "Approved recipe: frontend_title_mismatch_v2"
+          echo "Supported recipe: frontend_title_mismatch_v2"
 
       # STEP 5: SETUP PYTHON
       - name: Set up Python
@@ -582,21 +988,26 @@ jobs:
 
           npm ci --ignore-scripts --no-audit --no-fund
 
-      # STEP 9: EXECUTE APPROVED RECIPE
-      - name: Execute approved unit test remediation
+            # STEP 9: EXECUTE REMEDIATION AND CREATE REVIEWABLE PATCH
+      - name: Execute authorized unit test remediation
         id: remediation
         shell: bash
         env:
           SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
           SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+          CONTROLLER_SHA: ${{ needs.diagnose.outputs.controller_sha }}
+          VERIFIED_RECIPE: ${{ needs.diagnose.outputs.verified_recipe }}
 
         run: |
           set -euo pipefail
 
-          echo "Executing approved deterministic remediation."
+          echo "Executing deterministic remediation under the selected authorization mode."
           echo "Recipe: frontend_title_mismatch_v2"
           echo "Source branch: $SOURCE_BRANCH"
           echo "Source SHA: $SOURCE_SHA"
+
+          mkdir -p source/reports handoff
 
           mapfile -t REPORTS < <(
             find diagnosis \
@@ -613,13 +1024,20 @@ jobs:
 
           REPORT="${REPORTS[0]}"
 
-          mkdir -p source/reports
-
           set +e
+
+          AUTHORIZATION_ARGS=()
+          if [[ "$VERIFIED_RECIPE" == "true" ]]; then
+            echo "Authorization: manually verified recipe; approval gates bypassed."
+            AUTHORIZATION_ARGS+=(--verified-recipe)
+          else
+            echo "Authorization: prior human approval."
+            AUTHORIZATION_ARGS+=(--approve)
+          fi
 
           python -m cicd_recovery.remediation \
             --project-root "$GITHUB_WORKSPACE/source" \
-            --approve \
+            "${AUTHORIZATION_ARGS[@]}" \
             --diagnosis-report "$GITHUB_WORKSPACE/$REPORT" \
             --expected-source-sha "$SOURCE_SHA" \
             --expected-source-branch "$SOURCE_BRANCH" \
@@ -631,27 +1049,175 @@ jobs:
 
           cat "$GITHUB_WORKSPACE/remediation-execution.log"
 
-          AUDIT=$(find source/reports \
-            -maxdepth 1 \
-            -name 'remediation-frontend_title_mismatch_v2-*.json' \
-            -type f \
-            | sort \
-            | tail -n 1 || true)
+          mapfile -t AUDIT_FILES < <(
+            find source/reports \
+              -maxdepth 1 \
+              -type f \
+              -name 'remediation-frontend_title_mismatch_v2-*.json' \
+              -print
+          )
 
-          if [[ -z "$AUDIT" ]]; then
-            {
-              echo ""
-              echo "## Remediation execution failed"
-              echo ""
-              echo "No v2 audit report was generated."
-              echo "Check the execution log."
-            } >> "$GITHUB_STEP_SUMMARY"
-
-            echo "::error::Remediation audit report was not generated."
+          if [[ "${#AUDIT_FILES[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one remediation audit report."
             exit 1
           fi
 
+          AUDIT="${AUDIT_FILES[0]}"
+
           STATUS=$(jq -r '.status // "unknown"' "$AUDIT")
+
+          if [[ "$EXIT_CODE" -ne 0 ]]; then
+            echo "::error::Remediation execution failed with exit code $EXIT_CODE."
+            exit "$EXIT_CODE"
+          fi
+
+          EXPECTED_STATUS="validated_pending_commit_approval"
+          if [[ "$VERIFIED_RECIPE" == "true" ]]; then
+            EXPECTED_STATUS="validated_verified_pending_commit"
+          fi
+
+          if [[ "$STATUS" != "$EXPECTED_STATUS" ]]; then
+            echo "::error::Unexpected remediation status: $STATUS (expected $EXPECTED_STATUS)"
+            exit 1
+          fi
+
+          # Verify the audit before creating a commit handoff.
+          jq -e \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
+              .schema_version == 2
+              and .recipe_id == "frontend_title_mismatch_v2"
+              and .verified_recipe == $verified_recipe
+              and (
+                if $verified_recipe then
+                  .status == "validated_verified_pending_commit"
+                  and .approval.received == false
+                  and .authorization.type == "manually_verified_recipe"
+                  and .authorization.granted == true
+                else
+                  .status == "validated_pending_commit_approval"
+                  and .approval.received == true
+                  and .authorization.type == "human_approval"
+                  and .authorization.granted == true
+                end
+              )
+              and .applicability.diagnosis.source_sha == $source_sha
+              and .applicability.diagnosis.source_branch == $source_branch
+              and (.changed_files | type) == "array"
+              and (.changed_files | length) > 0
+              and (.changed_files | length) == (.changed_files | unique | length)
+              and all(
+                .changed_files[];
+                . == "frontend/src/index.html"
+                or . == "frontend/test/app.test.js"
+                or . == "frontend/test/known-issue-demo.test.js"
+              )
+              and (.validation | length) == 2
+              and (
+                .validation | map(.command)
+              ) == ["npm test", "npm run build"]
+              and (.validation | all(.passed == true))
+              and .commit_performed == false
+              and .push_performed == false
+              and .ci_retry_triggered == false
+              and (.after_sha256 | has("frontend/src/index.html"))
+              and (.after_sha256 | has("frontend/test/app.test.js"))
+              and (.after_sha256 | has("frontend/test/known-issue-demo.test.js"))
+            ' "$AUDIT" > /dev/null
+
+          mapfile -t CHANGED_FILES < <(
+            jq -r '.changed_files[]' "$AUDIT"
+          )
+
+          mapfile -t DIFF_FILES < <(
+            git -C source diff --name-only
+          )
+
+          if [[ "${#CHANGED_FILES[@]}" -eq 0 ]]; then
+            echo "::error::No changed files to hand off. Refusing to create an empty commit."
+            exit 1
+          fi
+
+          if [[ "${#DIFF_FILES[@]}" -eq 0 ]]; then
+            echo "::error::Git did not detect the audited file changes."
+            exit 1
+          fi
+
+          # Confirm that the audit and actual Git diff identify exactly
+          # the same files.
+          printf '%s\n' "${CHANGED_FILES[@]}" \
+            | LC_ALL=C sort > handoff/audit-files.txt
+
+          printf '%s\n' "${DIFF_FILES[@]}" \
+            | LC_ALL=C sort > handoff/git-diff-files.txt
+
+          if ! diff -u handoff/audit-files.txt handoff/git-diff-files.txt; then
+            echo "::error::Audit changed_files does not match the actual Git diff."
+            exit 1
+          fi
+
+          # Refuse unexpected untracked files in the source checkout.
+          UNTRACKED_FILES=$(git -C source ls-files --others --exclude-standard)
+
+          if [[ -n "$UNTRACKED_FILES" ]]; then
+            echo "::error::Unexpected untracked files found in source checkout:"
+            echo "$UNTRACKED_FILES"
+            exit 1
+          fi
+
+          # Generate a binary-safe patch containing only audited files.
+          git -C source diff \
+            --binary \
+            --no-ext-diff \
+            -- "${CHANGED_FILES[@]}" \
+            > handoff/remediation.patch
+
+          if [[ ! -s handoff/remediation.patch ]]; then
+            echo "::error::Generated remediation patch is empty."
+            exit 1
+          fi
+
+          git -C source apply --stat \
+            "$GITHUB_WORKSPACE/handoff/remediation.patch" \
+            > handoff/patch-stat.txt
+
+          # Copy the audit into the handoff bundle.
+          cp "$AUDIT" handoff/audit.json
+
+          PATCH_SHA256=$(sha256sum handoff/remediation.patch | awk '{print $1}')
+          AUDIT_SHA256=$(sha256sum handoff/audit.json | awk '{print $1}')
+          CHANGED_FILES_JSON=$(jq -c '.changed_files' "$AUDIT")
+
+          # Create a manifest binding the patch and audit to this exact run.
+          jq -n \
+            --arg recipe_id "frontend_title_mismatch_v2" \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg source_run_id "$SOURCE_RUN_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --arg controller_sha "$CONTROLLER_SHA" \
+            --arg patch_sha256 "$PATCH_SHA256" \
+            --arg audit_sha256 "$AUDIT_SHA256" \
+            --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" \
+            --argjson changed_files "$CHANGED_FILES_JSON" \
+            '{
+              schema_version: 1,
+              recipe_id: $recipe_id,
+              repository: $repository,
+              source_run_id: $source_run_id,
+              source_sha: $source_sha,
+              source_branch: $source_branch,
+              controller_sha: $controller_sha,
+              verified_recipe: $verified_recipe,
+              generated_at: $generated_at,
+              patch_file: "remediation.patch",
+              patch_sha256: $patch_sha256,
+              audit_file: "audit.json",
+              audit_sha256: $audit_sha256,
+              changed_files: $changed_files
+            }' > handoff/manifest.json
 
           {
             echo ""
@@ -661,24 +1227,1124 @@ jobs:
             echo "- Result: $STATUS"
             echo "- Source branch: $SOURCE_BRANCH"
             echo "- Source SHA: $SOURCE_SHA"
+            echo "- Changed files: ${#CHANGED_FILES[@]}"
+            echo "- Patch SHA256: $PATCH_SHA256"
+            echo "- Audit SHA256: $AUDIT_SHA256"
             echo "- Commit: Not performed"
             echo "- Push: Not performed"
             echo "- CI retry: Not performed"
           } >> "$GITHUB_STEP_SUMMARY"
 
-          if [[ "$EXIT_CODE" -ne 0 ]]; then
-            echo "::error::Remediation or validation failed. No commit or retry will be performed."
-            exit "$EXIT_CODE"
-          fi
+          echo "Validated remediation patch and audit handoff created."
 
-      # STEP 10: UPLOAD REMEDIATION AUDIT
-      - name: Upload remediation audit and execution log
+
+      # STEP 10: PRESERVE EXECUTION EVIDENCE
+      - name: Upload remediation execution evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: remediation-result-${{ needs.diagnose.outputs.source_run_id }}
+          name: remediation-execution-evidence-${{ needs.diagnose.outputs.source_run_id }}
           path: |
             source/reports/*.json
             remediation-execution.log
+          if-no-files-found: warn
+          retention-days: 14
+
+
+      # STEP 11: UPLOAD VALIDATED PATCH FOR REVIEW
+      - name: Upload validated remediation handoff
+        if: ${{ steps.remediation.outcome == 'success' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: validated-remediation-${{ needs.diagnose.outputs.source_run_id }}
+          path: handoff/
+          if-no-files-found: error
+          retention-days: 14
+
+    # ==================================================
+  # JOB 4: REVIEW VALIDATED PATCH
+  # ==================================================
+  remediation-review:
+    name: Review Validated Remediation Patch
+
+    needs:
+      - diagnose
+      - remediation-execution
+
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.remediation-execution.result == 'success'
+        && needs.diagnose.outputs.unknown_failure != 'true'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+
+    steps:
+
+      - name: Download validated remediation handoff
+        uses: actions/download-artifact@v8
+        with:
+          name: validated-remediation-${{ needs.diagnose.outputs.source_run_id }}
+          path: review
+
+      - name: Verify patch and audit evidence
+        shell: bash
+        env:
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+          SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          CONTROLLER_SHA: ${{ needs.diagnose.outputs.controller_sha }}
+          VERIFIED_RECIPE: ${{ needs.diagnose.outputs.verified_recipe }}
+
+        run: |
+          set -euo pipefail
+
+          for FILE in manifest.json remediation.patch audit.json; do
+            if [[ ! -s "review/$FILE" ]]; then
+              echo "::error::Missing or empty handoff file: $FILE"
+              exit 1
+            fi
+          done
+
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$SOURCE_RUN_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --arg controller_sha "$CONTROLLER_SHA" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
+              .schema_version == 1
+              and .recipe_id == "frontend_title_mismatch_v2"
+              and .repository == $repository
+              and .source_run_id == $run_id
+              and .source_sha == $source_sha
+              and .source_branch == $source_branch
+              and .controller_sha == $controller_sha
+              and .verified_recipe == $verified_recipe
+              and .patch_file == "remediation.patch"
+              and .audit_file == "audit.json"
+              and (.changed_files | type) == "array"
+              and (.changed_files | length) > 0
+            ' review/manifest.json > /dev/null
+
+          EXPECTED_PATCH_SHA=$(jq -r '.patch_sha256' review/manifest.json)
+          EXPECTED_AUDIT_SHA=$(jq -r '.audit_sha256' review/manifest.json)
+
+          ACTUAL_PATCH_SHA=$(sha256sum review/remediation.patch | awk '{print $1}')
+          ACTUAL_AUDIT_SHA=$(sha256sum review/audit.json | awk '{print $1}')
+
+          if [[ "$ACTUAL_PATCH_SHA" != "$EXPECTED_PATCH_SHA" ]]; then
+            echo "::error::Remediation patch SHA256 mismatch."
+            exit 1
+          fi
+
+          if [[ "$ACTUAL_AUDIT_SHA" != "$EXPECTED_AUDIT_SHA" ]]; then
+            echo "::error::Remediation audit SHA256 mismatch."
+            exit 1
+          fi
+
+          MANIFEST_FILES=$(jq -c '.changed_files' review/manifest.json)
+
+          jq -e \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --argjson manifest_files "$MANIFEST_FILES" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
+              .schema_version == 2
+              and .recipe_id == "frontend_title_mismatch_v2"
+              and .verified_recipe == $verified_recipe
+              and (
+                if $verified_recipe then
+                  .status == "validated_verified_pending_commit"
+                  and .approval.received == false
+                  and .authorization.type == "manually_verified_recipe"
+                  and .authorization.granted == true
+                else
+                  .status == "validated_pending_commit_approval"
+                  and .approval.received == true
+                  and .authorization.type == "human_approval"
+                  and .authorization.granted == true
+                end
+              )
+              and .applicability.diagnosis.source_sha == $source_sha
+              and .applicability.diagnosis.source_branch == $source_branch
+              and .changed_files == $manifest_files
+              and (.validation | length) == 2
+              and (
+                .validation | map(.command)
+              ) == ["npm test", "npm run build"]
+              and (.validation | all(.passed == true))
+              and .commit_performed == false
+              and .push_performed == false
+              and .ci_retry_triggered == false
+              and all(
+                .changed_files[];
+                . == "frontend/src/index.html"
+                or . == "frontend/test/app.test.js"
+                or . == "frontend/test/known-issue-demo.test.js"
+              )
+            ' review/audit.json > /dev/null
+
+          git apply --stat review/remediation.patch \
+            | tee review/patch-stat.txt
+
+          echo "Patch and audit evidence verified."
+
+          {
+            echo "## Validated remediation patch — ready for commit controls"
+            echo ""
+            echo "- Recipe: frontend_title_mismatch_v2"
+            echo "- Source branch: $SOURCE_BRANCH"
+            echo "- Source SHA: \`$SOURCE_SHA\`"
+            echo "- Source workflow run: $SOURCE_RUN_ID"
+            echo "- Controller SHA: \`$CONTROLLER_SHA\`"
+            echo "- Patch SHA256: \`$ACTUAL_PATCH_SHA\`"
+            echo "- Audit SHA256: \`$ACTUAL_AUDIT_SHA\`"
+            echo ""
+            echo "### Files proposed for change"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r FILE; do
+            echo "- \`$FILE\`" >> "$GITHUB_STEP_SUMMARY"
+          done < <(jq -r '.changed_files[]' review/manifest.json)
+
+          {
+            echo ""
+            echo "### Validation results"
+            echo ""
+            echo "| Command | Passed |"
+            echo "|---|---|"
+            echo "| npm test | Yes |"
+            echo "| npm run build | Yes |"
+            echo ""
+            echo "### Actual proposed patch"
+            echo ""
+            echo '```diff'
+            cat review/remediation.patch
+            echo '```'
+            echo ""
+            echo "### Commit boundary"
+            echo ""
+            echo "No commit or push has been performed by the executor."
+            if [[ "$VERIFIED_RECIPE" == "true" ]]; then
+              echo "The manually verified recipe bypasses both human approval gates; patch integrity and source-revision checks still run before commit."
+            else
+              echo "A second human approval is required before the commit job can run."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+    # ==================================================
+  # JOB 5: START SECOND APPROVAL WINDOW
+  # ==================================================
+  second-approval-clock:
+    name: Start Second Approval Window
+    needs:
+      - diagnose
+      - remediation-review
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.unknown_failure != 'true'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+    runs-on: ubuntu-latest
+    outputs:
+      started_at_epoch: ${{ steps.clock.outputs.started_at_epoch }}
+    permissions:
+      contents: read
+    steps:
+      - name: Record second approval request start
+        id: clock
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "started_at_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "Second approval window started at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+
+
+  # ==================================================
+  # JOB 5: SECOND HUMAN APPROVAL FOR COMMIT
+  # ==================================================
+  commit-approval:
+    name: Second Human Approval - Commit Validated Remediation
+
+    needs:
+      - diagnose
+      - remediation-review
+      - second-approval-clock
+
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.unknown_failure != 'true'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    environment:
+      name: remediation-commit-approval
+
+    steps:
+
+      - name: Record second approval
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## Second approval gate passed"
+            echo ""
+            echo "- Approval mechanism: GitHub Environment required reviewers"
+            echo "- Environment: remediation-commit-approval"
+            echo "- Environment protection: Passed"
+            echo "- Patch review job: Successful"
+            echo "- Validated patch: Authorized for commit"
+            echo "- Target: Originating feature branch"
+            echo "- Force push: Not allowed"
+            echo "- CI retry API: Not used"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+    # ==================================================
+  # JOB 5A: SECOND APPROVAL DEADLINE WATCHDOG
+  # ==================================================
+  second-approval-watchdog:
+    name: Enforce Second Approval Deadline
+    needs:
+      - diagnose
+      - remediation-review
+      - second-approval-clock
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.unknown_failure != 'true'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Enforce second approval deadline
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ENVIRONMENT_NAME: remediation-commit-approval
+          APPROVAL_JOB_NAME: Second Human Approval - Commit Validated Remediation
+          APPROVAL_STARTED_AT: ${{ needs.second-approval-clock.outputs.started_at_epoch }}
+          APPROVAL_TIMEOUT_MINUTES: ${{ vars.APPROVAL_TIMEOUT_MINUTES || '30' }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$APPROVAL_TIMEOUT_MINUTES" =~ ^[1-9][0-9]*$ ]] \
+            || (( APPROVAL_TIMEOUT_MINUTES > 350 )); then
+            echo "::error::APPROVAL_TIMEOUT_MINUTES must be an integer from 1 to 350."
+            exit 1
+          fi
+
+          if [[ ! "$APPROVAL_STARTED_AT" =~ ^[0-9]+$ ]]; then
+            echo "::error::Approval start timestamp is missing or invalid."
+            exit 1
+          fi
+
+          MAX_WAIT_SECONDS=$((APPROVAL_TIMEOUT_MINUTES * 60))
+          MISCONFIGURED_GATE_STARTED_AT=""
+
+          cancel_workflow() {
+            local reason="$1"
+            {
+              echo ""
+              echo "## Second approval gate cancelled"
+              echo ""
+              echo "$reason"
+              echo "Commit and push will not execute."
+            } >> "$GITHUB_STEP_SUMMARY"
+
+            gh api --method POST \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/cancel" >/dev/null
+          }
+
+          echo "Monitoring environment approval: $ENVIRONMENT_NAME"
+          echo "Approval deadline: ${APPROVAL_TIMEOUT_MINUTES} minutes"
+
+          while true; do
+            APPROVALS=$(gh api \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/approvals")
+
+            # Verify that the first, distinct environment approval remains
+            # recorded before considering the second approval.
+            FIRST_REVIEW=$(jq -c '
+              [
+                .[]?
+                | select(
+                    any(
+                      .environments[]?;
+                      ((.name // "") | ascii_downcase) == "remediation-approval"
+                    )
+                  )
+              ]
+              | last // empty
+            ' <<< "$APPROVALS")
+
+            FIRST_STATE=""
+            if [[ -n "$FIRST_REVIEW" ]]; then
+              FIRST_STATE=$(jq -r '.state // "unknown"' <<< "$FIRST_REVIEW")
+            fi
+
+            if [[ "$FIRST_STATE" != "approved" ]]; then
+              cancel_workflow "The first approval history is missing or not approved. The second gate cannot authorize a commit."
+              echo "::error::First approval is not recorded as approved."
+              exit 1
+            fi
+
+            SECOND_REVIEW=$(jq -c --arg env "$ENVIRONMENT_NAME" '
+              [
+                .[]?
+                | select(
+                    any(
+                      .environments[]?;
+                      ((.name // "") | ascii_downcase) == ($env | ascii_downcase)
+                    )
+                  )
+              ]
+              | last // empty
+            ' <<< "$APPROVALS")
+
+            if [[ -n "$SECOND_REVIEW" ]]; then
+              REVIEW_STATE=$(jq -r '.state // "unknown"' <<< "$SECOND_REVIEW")
+              REVIEWER=$(jq -r '.user.login // "unknown"' <<< "$SECOND_REVIEW")
+
+              if [[ "$REVIEW_STATE" == "approved" ]]; then
+                {
+                  echo "## Second approval verified"
+                  echo ""
+                  echo "- Environment: $ENVIRONMENT_NAME"
+                  echo "- Reviewer: $REVIEWER"
+                  echo "- Approval recorded by GitHub: Yes"
+                } >> "$GITHUB_STEP_SUMMARY"
+                exit 0
+              fi
+
+              if [[ "$REVIEW_STATE" == "rejected" ]]; then
+                cancel_workflow "The second approval for '$ENVIRONMENT_NAME' was rejected by $REVIEWER."
+                echo "::error::Second approval was rejected."
+                exit 1
+              fi
+            fi
+
+            JOBS=$(gh api \
+              "repos/${REPOSITORY}/actions/runs/${RUN_ID}/jobs" \
+              -F per_page=100)
+
+            APPROVAL_JOB=$(jq -c --arg name "$APPROVAL_JOB_NAME" '
+              [.jobs[]? | select(.name == $name)] | last // empty
+            ' <<< "$JOBS")
+
+            JOB_STATUS="not_found"
+            JOB_CONCLUSION=""
+            if [[ -n "$APPROVAL_JOB" ]]; then
+              JOB_STATUS=$(jq -r '.status // "unknown"' <<< "$APPROVAL_JOB")
+              JOB_CONCLUSION=$(jq -r '.conclusion // ""' <<< "$APPROVAL_JOB")
+            fi
+
+            if [[ "$JOB_STATUS" == "completed" && "$JOB_CONCLUSION" != "success" ]]; then
+              echo "::error::Second approval job finished without a successful approval: $JOB_CONCLUSION"
+              exit 1
+            fi
+
+            if [[ "$JOB_STATUS" == "in_progress" \
+              || ( "$JOB_STATUS" == "completed" && "$JOB_CONCLUSION" == "success" ) ]]; then
+              if [[ -z "$MISCONFIGURED_GATE_STARTED_AT" ]]; then
+                MISCONFIGURED_GATE_STARTED_AT=$(date +%s)
+              fi
+
+              MISCONFIGURED_ELAPSED=$(( $(date +%s) - MISCONFIGURED_GATE_STARTED_AT ))
+              if (( MISCONFIGURED_ELAPSED >= 60 )); then
+                cancel_workflow "The second environment job started without a GitHub approval-history record. Verify required reviewers on '$ENVIRONMENT_NAME'."
+                echo "::error::Second environment approval could not be verified; workflow cancelled."
+                exit 1
+              fi
+            else
+              MISCONFIGURED_GATE_STARTED_AT=""
+            fi
+
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - APPROVAL_STARTED_AT))
+            REMAINING=$((MAX_WAIT_SECONDS - ELAPSED))
+            echo "Second approval elapsed: ${ELAPSED}s; remaining: ${REMAINING}s; gate job status: $JOB_STATUS"
+
+            if (( ELAPSED >= MAX_WAIT_SECONDS )); then
+              cancel_workflow "No approved review record was received for '$ENVIRONMENT_NAME' within ${APPROVAL_TIMEOUT_MINUTES} minutes."
+              echo "::error::Second approval deadline expired."
+              exit 1
+            fi
+
+            sleep 15
+          done
+
+
+  # ==================================================
+  # JOB 6: COMMIT AND PUSH AFTER REQUIRED AUTHORIZATION
+  # ==================================================
+  commit-push:
+    name: Commit Authorized Remediation and Verify Post-Push CI
+
+    needs:
+      - diagnose
+      - remediation-review
+      - commit-approval
+      - second-approval-watchdog
+
+    if: >-
+      ${{
+        always()
+        && needs.diagnose.result == 'success'
+        && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.unknown_failure != 'true'
+        && needs.diagnose.outputs.supported_recipe == 'true'
+        && (
+          (
+            needs.diagnose.outputs.approval_required == 'true'
+            && needs.commit-approval.result == 'success'
+            && needs.second-approval-watchdog.result == 'success'
+          )
+          ||
+          (
+            needs.diagnose.outputs.verified_recipe == 'true'
+            && needs.diagnose.outputs.approval_required == 'false'
+            && needs.commit-approval.result == 'skipped'
+            && needs.second-approval-watchdog.result == 'skipped'
+          )
+        )
+      }}
+
+    runs-on: ubuntu-latest
+    # Only this controlled job can push and explicitly dispatch Frontend CI.
+    permissions:
+      contents: write
+      actions: write
+
+    steps:
+
+      # STEP 1: DOWNLOAD THE EXACT VALIDATED PATCH
+      - name: Download validated remediation handoff
+        uses: actions/download-artifact@v8
+        with:
+          name: validated-remediation-${{ needs.diagnose.outputs.source_run_id }}
+          path: review
+
+      # STEP 2: CHECKOUT THE ORIGINATING FEATURE BRANCH USING GITHUB_TOKEN
+      - name: Checkout originating feature branch
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.diagnose.outputs.source_branch }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ github.token }}
+
+      # STEP 4: VERIFY BASE SHA, MANIFEST, AUDIT AND PATCH
+      - name: Verify authorized patch and source revision
+        shell: bash
+        env:
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+          SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          CONTROLLER_SHA: ${{ needs.diagnose.outputs.controller_sha }}
+          VERIFIED_RECIPE: ${{ needs.diagnose.outputs.verified_recipe }}
+
+        run: |
+          set -euo pipefail
+
+          if [[ "$SOURCE_BRANCH" != feature/* ]]; then
+            echo "::error::Commit is restricted to feature/* branches."
+            exit 1
+          fi
+
+          for FILE in manifest.json remediation.patch audit.json; do
+            if [[ ! -s "review/$FILE" ]]; then
+              echo "::error::Missing approved handoff file: $FILE"
+              exit 1
+            fi
+          done
+
+          jq -e \
+            --arg repository "$GITHUB_REPOSITORY" \
+            --arg run_id "$SOURCE_RUN_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --arg controller_sha "$CONTROLLER_SHA" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
+              .schema_version == 1
+              and .recipe_id == "frontend_title_mismatch_v2"
+              and .repository == $repository
+              and .source_run_id == $run_id
+              and .source_sha == $source_sha
+              and .source_branch == $source_branch
+              and .controller_sha == $controller_sha
+              and .verified_recipe == $verified_recipe
+              and .patch_file == "remediation.patch"
+              and .audit_file == "audit.json"
+              and (.changed_files | type) == "array"
+              and (.changed_files | length) > 0
+            ' review/manifest.json > /dev/null
+
+          EXPECTED_PATCH_SHA=$(jq -r '.patch_sha256' review/manifest.json)
+          EXPECTED_AUDIT_SHA=$(jq -r '.audit_sha256' review/manifest.json)
+
+          ACTUAL_PATCH_SHA=$(sha256sum review/remediation.patch | awk '{print $1}')
+          ACTUAL_AUDIT_SHA=$(sha256sum review/audit.json | awk '{print $1}')
+
+          if [[ "$ACTUAL_PATCH_SHA" != "$EXPECTED_PATCH_SHA" ]]; then
+            echo "::error::Patch SHA256 mismatch."
+            exit 1
+          fi
+
+          if [[ "$ACTUAL_AUDIT_SHA" != "$EXPECTED_AUDIT_SHA" ]]; then
+            echo "::error::Audit SHA256 mismatch."
+            exit 1
+          fi
+
+          MANIFEST_FILES=$(jq -c '.changed_files' review/manifest.json)
+
+          jq -e \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --argjson manifest_files "$MANIFEST_FILES" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
+              .schema_version == 2
+              and .recipe_id == "frontend_title_mismatch_v2"
+              and .verified_recipe == $verified_recipe
+              and (
+                if $verified_recipe then
+                  .status == "validated_verified_pending_commit"
+                  and .approval.received == false
+                  and .authorization.type == "manually_verified_recipe"
+                  and .authorization.granted == true
+                else
+                  .status == "validated_pending_commit_approval"
+                  and .approval.received == true
+                  and .authorization.type == "human_approval"
+                  and .authorization.granted == true
+                end
+              )
+              and .applicability.diagnosis.source_sha == $source_sha
+              and .applicability.diagnosis.source_branch == $source_branch
+              and .changed_files == $manifest_files
+              and (.validation | length) == 2
+              and (.validation | map(.command)) == ["npm test", "npm run build"]
+              and (.validation | all(.passed == true))
+              and .commit_performed == false
+              and .push_performed == false
+              and .ci_retry_triggered == false
+              and all(
+                .changed_files[];
+                . == "frontend/src/index.html"
+                or . == "frontend/test/app.test.js"
+                or . == "frontend/test/known-issue-demo.test.js"
+              )
+            ' review/audit.json > /dev/null
+
+          # Fail closed if the source branch changed after diagnosis.
+          ACTUAL_SOURCE_SHA=$(git -C source rev-parse HEAD)
+
+          if [[ "$ACTUAL_SOURCE_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::Feature branch has advanced since diagnosis."
+            echo "Expected: $SOURCE_SHA"
+            echo "Actual:   $ACTUAL_SOURCE_SHA"
+            echo "A fresh diagnosis is required before another remediation attempt."
+            exit 1
+          fi
+
+          if [[ -n "$(git -C source status --porcelain)" ]]; then
+            echo "::error::Feature branch checkout is not clean."
+            exit 1
+          fi
+
+          echo "Source revision and approved handoff verified."
+
+      # STEP 5: APPLY ONLY THE REVIEWED PATCH
+      - name: Apply and verify approved patch
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git -C source apply --check \
+            "$GITHUB_WORKSPACE/review/remediation.patch"
+
+          git -C source apply \
+            "$GITHUB_WORKSPACE/review/remediation.patch"
+
+          mapfile -t EXPECTED_FILES < <(
+            jq -r '.changed_files[]' review/manifest.json
+          )
+
+          mapfile -t ACTUAL_FILES < <(
+            git -C source diff --name-only
+          )
+
+          printf '%s\n' "${EXPECTED_FILES[@]}" \
+            | LC_ALL=C sort > review/expected-files.txt
+
+          printf '%s\n' "${ACTUAL_FILES[@]}" \
+            | LC_ALL=C sort > review/actual-files.txt
+
+          if ! diff -u review/expected-files.txt review/actual-files.txt; then
+            echo "::error::Applied patch changed unexpected files."
+            exit 1
+          fi
+
+          for FILE in \
+            frontend/src/index.html \
+            frontend/test/app.test.js \
+            frontend/test/known-issue-demo.test.js
+          do
+            EXPECTED_SHA=$(jq -r \
+              --arg file "$FILE" \
+              '.after_sha256[$file] // empty' \
+              review/audit.json)
+
+            if [[ -z "$EXPECTED_SHA" ]]; then
+              echo "::error::Missing audited after_sha256 for $FILE"
+              exit 1
+            fi
+
+            ACTUAL_SHA=$(sha256sum "source/$FILE" | awk '{print $1}')
+
+            if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
+              echo "::error::Post-apply file hash mismatch: $FILE"
+              exit 1
+            fi
+          done
+
+          git -C source diff --check
+          echo "Patch applied. All resulting file hashes match the validated audit."
+
+      # STEP 6: STAGE ONLY THE AUDITED FILES
+      - name: Stage approved files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -t CHANGED_FILES < <(
+            jq -r '.changed_files[]' review/manifest.json
+          )
+
+          git -C source add -- "${CHANGED_FILES[@]}"
+
+          mapfile -t STAGED_FILES < <(
+            git -C source diff --cached --name-only
+          )
+
+          printf '%s\n' "${CHANGED_FILES[@]}" \
+            | LC_ALL=C sort > review/expected-staged-files.txt
+
+          printf '%s\n' "${STAGED_FILES[@]}" \
+            | LC_ALL=C sort > review/actual-staged-files.txt
+
+          if ! diff -u \
+            review/expected-staged-files.txt \
+            review/actual-staged-files.txt; then
+            echo "::error::Staged files do not match the approved file list."
+            exit 1
+          fi
+
+          if git -C source diff --cached --quiet; then
+            echo "::error::No changes available to commit."
+            exit 1
+          fi
+
+          echo "Only audited and approved files are staged."
+
+      # STEP 7: COMMIT AND PUSH USING GITHUB_TOKEN
+      - name: Commit and push approved remediation
+        id: commit
+        shell: bash
+        env:
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+
+        run: |
+          set -euo pipefail
+
+          git -C source config user.name "github-actions[bot]"
+          git -C source config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git -C source commit \
+            -m "Apply approved CI remediation (run ${SOURCE_RUN_ID})"
+
+          COMMIT_SHA=$(git -C source rev-parse HEAD)
+
+          echo "Created commit: $COMMIT_SHA"
+          echo "Pushing to: $SOURCE_BRANCH"
+
+          set +e
+          git -C source push origin "HEAD:${SOURCE_BRANCH}"
+          PUSH_EXIT_CODE=$?
+          set -e
+
+          if [[ "$PUSH_EXIT_CODE" -eq 0 ]]; then
+            PUSH_STATUS="pushed_dispatch_pending"
+            PUSHED=true
+          else
+            PUSH_STATUS="push_rejected"
+            PUSHED=false
+          fi
+
+          jq -n \
+            --arg status "$PUSH_STATUS" \
+            --arg recipe_id "frontend_title_mismatch_v2" \
+            --arg source_branch "$SOURCE_BRANCH" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg commit_sha "$COMMIT_SHA" \
+            --arg source_run_id "$SOURCE_RUN_ID" \
+            --arg created_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson commit_created true \
+            --argjson pushed "$PUSHED" \
+            '{
+              schema_version: 3,
+              status: $status,
+              recipe_id: $recipe_id,
+              source_run_id: $source_run_id,
+              source_branch: $source_branch,
+              source_sha: $source_sha,
+              commit_sha: $commit_sha,
+              commit_created: $commit_created,
+              pushed: $pushed,
+              push_authentication: "GITHUB_TOKEN",
+              post_push_ci: {
+                trigger: "workflow_dispatch",
+                dispatched: false,
+                status: (if $pushed then "dispatch_pending" else "not_started" end),
+                workflow_id: null,
+                run_id: null,
+                conclusion: null,
+                url: null
+              },
+              ci_retry_triggered: false,
+              created_at: $created_at
+            }' > "$GITHUB_WORKSPACE/commit-result.json"
+
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "pushed=$PUSHED" >> "$GITHUB_OUTPUT"
+
+          if [[ "$PUSH_EXIT_CODE" -ne 0 ]]; then
+            echo "::error::Commit was created locally, but GitHub rejected the push."
+            echo "Check branch protection rules and repository permissions."
+            exit 1
+          fi
+
+          {
+            echo ""
+            echo "## Authorized remediation committed and pushed"
+            echo ""
+            echo "- Recipe: frontend_title_mismatch_v2"
+            echo "- Branch: $SOURCE_BRANCH"
+            echo "- Original SHA: \`$SOURCE_SHA\`"
+            echo "- New commit: \`$COMMIT_SHA\`"
+            echo "- Commit: Completed"
+            echo "- Push: Completed using GITHUB_TOKEN"
+            echo "- Post-push Frontend CI: Dispatching workflow_dispatch"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # STEP 8: DISCOVER AND DISPATCH THE EXISTING FRONTEND CI WORKFLOW
+      - name: Dispatch Frontend CI for remediation commit
+        id: dispatch-ci
+        if: ${{ steps.commit.outputs.pushed == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+
+        run: |
+          set -euo pipefail
+
+          # Workflow dispatch requires the workflow to exist on the default
+          # branch, but the selected ref controls which branch is executed.
+          WORKFLOWS=$(gh api \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${REPOSITORY}/actions/workflows?per_page=100")
+
+          MATCHING_WORKFLOWS=$(jq -c '
+            [
+              .workflows[]?
+              | select(.name == "Frontend CI" and .state == "active")
+            ]
+          ' <<< "$WORKFLOWS")
+
+          MATCH_COUNT=$(jq 'length' <<< "$MATCHING_WORKFLOWS")
+
+          if [[ "$MATCH_COUNT" -ne 1 ]]; then
+            jq '.status = "pushed_ci_dispatch_failed"
+                | .post_push_ci.status = "workflow_not_found_or_ambiguous"' \
+              commit-result.json > commit-result.tmp
+            mv commit-result.tmp commit-result.json
+            echo "::error::Expected exactly one active 'Frontend CI' workflow on the default branch; found $MATCH_COUNT."
+            exit 1
+          fi
+
+          WORKFLOW_ID=$(jq -r '.[0].id' <<< "$MATCHING_WORKFLOWS")
+          WORKFLOW_PATH=$(jq -r '.[0].path' <<< "$MATCHING_WORKFLOWS")
+
+          echo "Frontend CI workflow ID: $WORKFLOW_ID"
+          echo "Frontend CI workflow path: $WORKFLOW_PATH"
+          echo "Target branch: $SOURCE_BRANCH"
+          echo "Target commit: $COMMIT_SHA"
+
+          # Capture the dispatch start time so the fallback does not mistake
+          # an older manual run on the same SHA for this dispatch.
+          DISPATCH_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          DISPATCH_BODY=$(jq -n \
+            --arg ref "$SOURCE_BRANCH" \
+            '{ref: $ref, return_run_details: true}')
+
+          DISPATCH_RESPONSE=""
+          DISPATCH_EXIT_CODE=0
+
+          set +e
+          DISPATCH_RESPONSE=$(printf '%s' "$DISPATCH_BODY" | gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "repos/${REPOSITORY}/actions/workflows/${WORKFLOW_ID}/dispatches" \
+            --input - 2>&1)
+          DISPATCH_EXIT_CODE=$?
+          set -e
+
+          if [[ "$DISPATCH_EXIT_CODE" -ne 0 ]]; then
+            echo "Dispatch call returned a non-zero exit code; checking whether GitHub accepted it."
+            echo "$DISPATCH_RESPONSE"
+          fi
+
+          # Preferred path: use the run ID returned by GitHub when the
+          # return_run_details option is supported by the API response.
+          DISPATCH_RUN_ID=""
+          DISPATCH_RUN_URL=""
+
+          if [[ -n "$DISPATCH_RESPONSE" ]] && jq -e . >/dev/null 2>&1 <<< "$DISPATCH_RESPONSE"; then
+            DISPATCH_RUN_ID=$(jq -r '.workflow_run_id // empty' <<< "$DISPATCH_RESPONSE")
+            DISPATCH_RUN_URL=$(jq -r '.html_url // .run_url // empty' <<< "$DISPATCH_RESPONSE")
+          fi
+
+          # Fallback: an accepted dispatch can still return an empty body
+          # (HTTP 204). Discover the run by exact workflow, event, branch,
+          # commit SHA, and creation time instead of failing on a blank body.
+          if [[ ! "$DISPATCH_RUN_ID" =~ ^[0-9]+$ ]]; then
+            echo "No workflow_run_id in dispatch response; searching for the exact dispatched run."
+
+            while true; do
+              echo "Looking for the dispatched Frontend CI run..."
+
+              RUN_LIST=$(gh api \
+                -H "X-GitHub-Api-Version: 2026-03-10" \
+                --method GET \
+                "repos/${REPOSITORY}/actions/workflows/${WORKFLOW_ID}/runs" \
+                -f branch="$SOURCE_BRANCH" \
+                -f event=workflow_dispatch \
+                -f head_sha="$COMMIT_SHA" \
+                -F per_page=100)
+
+              MATCHING_RUN=$(jq -c \
+                --arg workflow_id "$WORKFLOW_ID" \
+                --arg branch "$SOURCE_BRANCH" \
+                --arg sha "$COMMIT_SHA" \
+                --arg started_at "$DISPATCH_STARTED_AT" '
+                  [
+                    .workflow_runs[]?
+                    | select(
+                        ((.workflow_id | tostring) == $workflow_id)
+                        and .event == "workflow_dispatch"
+                        and .head_branch == $branch
+                        and .head_sha == $sha
+                        and (.created_at // "") >= $started_at
+                      )
+                  ]
+                  | sort_by(.created_at)
+                  | last // empty
+                ' <<< "$RUN_LIST")
+
+              if [[ -n "$MATCHING_RUN" ]]; then
+                DISPATCH_RUN_ID=$(jq -r '.id | tostring' <<< "$MATCHING_RUN")
+                DISPATCH_RUN_URL=$(jq -r '.html_url // empty' <<< "$MATCHING_RUN")
+                break
+              fi
+
+              sleep 5
+            done
+          fi
+
+          if [[ ! "$DISPATCH_RUN_ID" =~ ^[0-9]+$ ]]; then
+            jq '.status = "pushed_ci_dispatch_failed"
+                | .post_push_ci.status = "dispatch_accepted_but_run_not_found"' \
+              commit-result.json > commit-result.tmp
+            mv commit-result.tmp commit-result.json
+
+            echo "::error::Could not identify the dispatched Frontend CI run."
+            echo "Dispatch API exit code: $DISPATCH_EXIT_CODE"
+            echo "Dispatch response: $DISPATCH_RESPONSE"
+            exit 1
+          fi
+
+          echo "workflow_id=$WORKFLOW_ID" >> "$GITHUB_OUTPUT"
+          echo "workflow_path=$WORKFLOW_PATH" >> "$GITHUB_OUTPUT"
+          echo "run_id=$DISPATCH_RUN_ID" >> "$GITHUB_OUTPUT"
+          echo "run_url=$DISPATCH_RUN_URL" >> "$GITHUB_OUTPUT"
+
+          jq \
+            --arg workflow_id "$WORKFLOW_ID" \
+            --arg workflow_path "$WORKFLOW_PATH" \
+            --arg run_id "$DISPATCH_RUN_ID" \
+            --arg run_url "$DISPATCH_RUN_URL" \
+            '.post_push_ci.workflow_id = $workflow_id
+             | .post_push_ci.workflow_path = $workflow_path
+             | .post_push_ci.run_id = $run_id
+             | .post_push_ci.url = $run_url
+             | .post_push_ci.dispatched = true
+             | .post_push_ci.status = "dispatched"' \
+            commit-result.json > commit-result.tmp
+          mv commit-result.tmp commit-result.json
+
+          {
+            echo ""
+            echo "## Frontend CI dispatched"
+            echo ""
+            echo "- Workflow: $WORKFLOW_PATH"
+            echo "- Workflow ID: $WORKFLOW_ID"
+            echo "- Run ID: $DISPATCH_RUN_ID"
+            echo "- Ref: $SOURCE_BRANCH"
+            echo "- Commit SHA: \`$COMMIT_SHA\`"
+            echo "- Event: workflow_dispatch"
+            echo "- Dispatch API response: $([[ -n "$DISPATCH_RESPONSE" ]] && echo "with body" || echo "empty; run found by API query")"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # STEP 9: WAIT FOR THE EXACT DISPATCHED RUN
+      - name: Wait for post-remediation Frontend CI
+        id: post-push-ci
+        if: ${{ steps.dispatch-ci.outcome == 'success' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          COMMIT_SHA: ${{ steps.commit.outputs.commit_sha }}
+          WORKFLOW_ID: ${{ steps.dispatch-ci.outputs.workflow_id }}
+          DISPATCH_RUN_ID: ${{ steps.dispatch-ci.outputs.run_id }}
+          DISPATCH_RUN_URL: ${{ steps.dispatch-ci.outputs.run_url }}
+
+        run: |
+          set -euo pipefail
+
+          RUN_DATA=""
+
+          # Wait for the exact dispatched run to complete. No additional
+          # project-specific timeout is imposed on CI execution.
+          while true; do
+            echo "Waiting for Frontend CI run $DISPATCH_RUN_ID..."
+
+            if ! RUN_DATA=$(gh api \
+              "repos/${REPOSITORY}/actions/runs/${DISPATCH_RUN_ID}"); then
+              echo "Frontend CI run detail is not available yet."
+              sleep 10
+              continue
+            fi
+
+            RUN_STATUS=$(jq -r '.status // ""' <<< "$RUN_DATA")
+            echo "Frontend CI status: $RUN_STATUS"
+
+            if [[ "$RUN_STATUS" == "completed" ]]; then
+              break
+            fi
+
+            sleep 10
+          done
+
+          # Bind the returned run to the exact workflow, ref and commit.
+          jq -e \
+            --arg repo "$REPOSITORY" \
+            --arg branch "$SOURCE_BRANCH" \
+            --arg sha "$COMMIT_SHA" \
+            --arg workflow_id "$WORKFLOW_ID" '
+              .name == "Frontend CI"
+              and .event == "workflow_dispatch"
+              and .head_branch == $branch
+              and .head_sha == $sha
+              and ((.workflow_id | tostring) == $workflow_id)
+              and .repository.full_name == $repo
+              and .status == "completed"
+            ' <<< "$RUN_DATA" > /dev/null
+
+          CI_RUN_ID=$(jq -r '.id | tostring' <<< "$RUN_DATA")
+          CI_CONCLUSION=$(jq -r '.conclusion // "unknown"' <<< "$RUN_DATA")
+          CI_URL=$(jq -r '.html_url // empty' <<< "$RUN_DATA")
+          CI_STATUS=$(jq -r '.status // "unknown"' <<< "$RUN_DATA")
+
+          if [[ -z "$CI_URL" ]]; then
+            CI_URL="$DISPATCH_RUN_URL"
+          fi
+
+          if [[ "$CI_CONCLUSION" == "success" ]]; then
+            FINAL_STATUS="pushed_ci_success"
+          else
+            FINAL_STATUS="pushed_ci_failure"
+          fi
+
+          jq \
+            --arg final_status "$FINAL_STATUS" \
+            --arg ci_status "$CI_STATUS" \
+            --arg ci_run_id "$CI_RUN_ID" \
+            --arg ci_conclusion "$CI_CONCLUSION" \
+            --arg ci_url "$CI_URL" \
+            '.status = $final_status
+             | .post_push_ci.status = $ci_status
+             | .post_push_ci.run_id = $ci_run_id
+             | .post_push_ci.conclusion = $ci_conclusion
+             | .post_push_ci.url = $ci_url' \
+            commit-result.json > commit-result.tmp
+          mv commit-result.tmp commit-result.json
+
+          {
+            echo ""
+            echo "## Post-push Frontend CI result"
+            echo ""
+            echo "- Remediation commit: \`$COMMIT_SHA\`"
+            echo "- CI run: [$CI_RUN_ID]($CI_URL)"
+            echo "- Conclusion: $CI_CONCLUSION"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [[ "$CI_CONCLUSION" != "success" ]]; then
+            echo "::error::Post-remediation Frontend CI completed with conclusion: $CI_CONCLUSION"
+            echo "The remediation commit remains pushed. No automatic rollback or second remediation will be attempted."
+            exit 1
+          fi
+
+          echo "Post-remediation Frontend CI passed."
+
+      # STEP 10: PRESERVE COMMIT AND POST-PUSH CI RESULT
+      - name: Upload commit and post-push CI result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: remediation-commit-result-${{ needs.diagnose.outputs.source_run_id }}
+          path: commit-result.json
           if-no-files-found: warn
           retention-days: 14

@@ -86,8 +86,17 @@ def _print_report_summary(report: dict[str, Any]) -> None:
         print(f"Failed step: {step_names or 'not reported'}")
         print(f"Category   : {diagnosis.get('category')}\nDiagnosis  : {diagnosis.get('title')}")
         print("Rule IDs   : " + (", ".join(diagnosis.get("matched_rule_ids", [])) or "none (unknown)"))
+        unknown_triage = diagnosis.get("unknown_triage")
+        if unknown_triage:
+            print("Routing    : MANUAL ENGINEERING INVESTIGATION")
+            print("Approval   : NOT REQUIRED / NOT REQUESTED")
+            print("Remediation: DISABLED FOR UNKNOWN FAILURE")
         print(f"Remediation candidate: {diagnosis.get('retry_candidate_for_future_policy_review', False)}")
         _print_recommendation(diagnosis.get("recommendation", "Review logs manually."))
+        if diagnosis.get("unknown_triage"):
+            print("Unknown-failure investigation actions:")
+            for action in diagnosis["unknown_triage"].get("recommended_actions", []):
+                print(f"  - {action}")
         _print_remediation_plan(diagnosis.get("remediation_plan", {}))
         for group in diagnosis.get("evidence", []):
             for line in group.get("lines", []):
@@ -114,7 +123,14 @@ def command_diagnose_fixture(args: argparse.Namespace) -> int:
         "schema_version": 2, "mode": "local_fixture_diagnosis_and_policy_preview",
         "ai_enabled": False, "recovery_enabled": False, "fixture": log_path.name,
         "analyses": [analysis],
+        "routing": {
+            "unknown_failure_present": analysis["diagnosis"]["category"] == "unknown",
+            "unknown_failure_approval_gate": False,
+            "unknown_failure_action": "manual_engineering_investigation_only",
+            "unknown_failure_remediation_allowed": False,
+        },
         "limitations": ["Remediation is policy-preview only.",
+                        "Unknown failures require manual engineering investigation and never enter approval gates.",
                         "No validation command is executed and no source files are modified."],
     }
     _print_report_summary(report)
@@ -170,8 +186,20 @@ def _append_github_step_summary(report: dict[str, Any]) -> None:
             f"- **Log scope:** {analysis.get('log_scope', 'full job log')}",
             f"- **Category:** `{diagnosis.get('category', 'unknown')}`",
             "- **Matched rules:** " + (", ".join(diagnosis.get("matched_rule_ids", [])) or "none"), "",
-            "#### Recommended resolution steps", "",
         ])
+        unknown_triage = diagnosis.get("unknown_triage")
+        if unknown_triage:
+            lines.extend([
+                "#### Unknown failure — manual investigation required", "",
+                "- **Route:** `manual_engineering_investigation`",
+                "- **Human approval:** not requested",
+                "- **Remediation / commit / push / retry:** prohibited for this unknown failure",
+                f"- **Reason:** {unknown_triage.get('reason', 'No configured rule matched.')}",
+                "", "#### Investigation checklist", "",
+            ])
+            lines.extend(f"- {action}" for action in unknown_triage.get("recommended_actions", []))
+            lines.append("")
+        lines.extend(["#### Recommended resolution steps", ""])
         recommendation = str(diagnosis.get("recommendation", "Review logs manually.")).strip()
         lines.extend(recommendation.splitlines() if recommendation else ["Review logs manually."])
         lines.append("")

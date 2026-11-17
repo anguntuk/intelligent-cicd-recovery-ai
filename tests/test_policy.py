@@ -82,3 +82,27 @@ rules:
     )
     with pytest.raises(ValueError, match="unsupported validation command"):
         load_rules(rule_file)
+
+
+def test_manually_verified_high_risk_recipe_bypasses_human_approval():
+    spec = RemediationSpec(
+        True, "high", "assisted", True, 1, ("npm test",),
+        "originating_feature_branch", True, verified=True,
+    )
+    plan = evaluate_remediation_policy(retry_candidate=True, remediation=spec)
+    assert plan.decision == "verified_auto_execution"
+    assert plan.eligible is True
+    assert plan.verified is True
+    assert plan.requires_approval is False
+    assert plan.approval_gates == ()
+    assert "validation" in plan.next_action
+
+
+def test_unverified_high_risk_recipe_still_requires_approval_by_default():
+    rule = next(r for r in load_rules(ROOT / "config/rules.yaml") if r.rule_id == "unit_test_failure")
+    assert rule.remediation is not None
+    assert rule.remediation.verified is False
+    plan = evaluate_remediation_policy(retry_candidate=rule.retry_candidate, remediation=rule.remediation)
+    assert plan.decision == "approval_required"
+    assert plan.requires_approval is True
+    assert plan.verified is False

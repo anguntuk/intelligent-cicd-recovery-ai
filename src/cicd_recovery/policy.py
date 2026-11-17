@@ -20,6 +20,7 @@ class RemediationDecision:
     commit_only_after_validation: bool
     execution_status: str
     executor_available: bool
+    verified: bool
     reason: str
     next_action: str
 
@@ -50,6 +51,7 @@ def evaluate_remediation_policy(
         "commit_only_after_validation": remediation.commit_only_after_validation if remediation else True,
         "execution_status": "not_executed",
         "executor_available": False,
+        "verified": remediation.verified if remediation else False,
     }
 
     if remediation is None:
@@ -75,6 +77,21 @@ def evaluate_remediation_policy(
             decision="attempt_limit_reached", eligible=False, requires_approval=False,
             approval_gates=(), reason="The configured remediation attempt limit has been reached.",
             next_action="Stop remediation and request engineering review.",
+        )
+    elif remediation.verified:
+        # Explicit manual verification is the only exception to the normal risk gate.
+        # The executor still performs semantic checks and all configured validation.
+        values = dict(
+            decision="verified_auto_execution", eligible=True, requires_approval=False,
+            approval_gates=(),
+            reason=(
+                "This remediation recipe is manually marked verified in config/rules.yaml. "
+                "Human approval gates are bypassed; execution and validation checks remain required."
+            ),
+            next_action=(
+                "Execute the exact allowlisted recipe, run every configured validation command, "
+                "verify the patch and audit evidence, then commit/push and explicitly run CI."
+            ),
         )
     else:
         # Medium/high risk must require approval, even if the YAML flag was set false.

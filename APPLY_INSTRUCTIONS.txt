@@ -1,0 +1,47 @@
+UNKNOWN FAILURE TRIAGE UPDATE (NO AI)
+
+Purpose
+  Route failures that match no configured deterministic rule to manual
+  engineering investigation. Unknown failures must not enter either human
+  remediation approval gate and must never reach the remediation/commit path.
+
+Replace these existing files:
+  .github/workflows/debug-frontend.yml
+  src/cicd_recovery/analyzer.py
+  src/cicd_recovery/cli.py
+  config/rules.yaml
+  tests/test_analyzer.py
+  README.md
+
+Add this new test file:
+  tests/test_workflow_unknown_routing.py
+
+Keep this existing fixture (included for reference/testing):
+  fixtures/logs/unknown_failure.log
+
+No changes are required to:
+  src/cicd_recovery/policy.py
+  src/cicd_recovery/remediation.py
+  .github/workflows/frontend-ci.yml
+
+Behavior
+  1. No rule matches -> category=unknown.
+  2. Analyzer writes unknown_triage metadata and keeps AI disabled.
+  3. The workflow sets approval_required=false when any analysis is unknown.
+  4. A dedicated unknown-failure-triage job creates a report/checklist artifact.
+  5. First approval, second approval, watchdog, remediation, commit, push and
+     post-push CI dispatch jobs are explicitly excluded for unknown failures.
+  6. The incident ends at manual engineering investigation; no approval,
+     source edit, patch, commit, push or retry is requested or performed.
+
+Validation performed on the assembled update:
+  python -m pytest -v                         -> 36 passed
+  YAML parsing                                -> passed
+  23 embedded Bash scripts (bash -n)          -> passed
+  Inline Python triage-report script          -> syntax passed
+  Triage step exercised against fixture       -> passed
+
+End-to-end GitHub Actions execution has not yet been run for this new unknown
+failure route. To test it in GitHub, trigger a Frontend CI failure whose log
+contains no signature from config/rules.yaml; do not use the known title
+mismatch fixture because that is intentionally classified by unit_test_failure.

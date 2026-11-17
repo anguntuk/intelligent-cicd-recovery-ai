@@ -270,6 +270,7 @@ def _validate_diagnosis_report(
     *,
     expected_source_sha: str | None = None,
     expected_source_branch: str | None = None,
+    require_verified_recipe: bool = False,
 ) -> dict[str, str]:
     """Require evidence for this exact title mismatch, not just any unit-test failure."""
     try:
@@ -317,6 +318,18 @@ def _validate_diagnosis_report(
     if expected_source_branch and run.get("head_branch") != expected_source_branch:
         raise ValueError(
             "Diagnosis report source branch does not match the checked-out source branch"
+        )
+
+    plan = diagnosis.get("remediation_plan") or {}
+    if require_verified_recipe and not (
+        plan.get("verified") is True
+        and plan.get("eligible") is True
+        and plan.get("requires_approval") is False
+        and plan.get("decision") == "verified_auto_execution"
+    ):
+        raise ValueError(
+            "Verified-recipe authorization requires a diagnosis report whose remediation "
+            "policy explicitly marks this recipe verified and eligible"
         )
 
     return {
@@ -402,17 +415,25 @@ def run_remediation(
     project_root: Path,
     *,
     approved: bool,
+    verified_recipe: bool = False,
     diagnosis_report: Path | None = None,
     expected_source_sha: str | None = None,
     expected_source_branch: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     root = project_root.resolve()
 
-    if not approved:
+    if approved and verified_recipe:
+        return 2, {
+            "status": "invalid_authorization",
+            "message": "Choose either human approval or verified-recipe authorization, not both.",
+        }
+
+    if not approved and not verified_recipe:
         return 2, {
             "status": "approval_required",
             "message": (
-                "Pass --approve only after the remediation proposal has been reviewed."
+                "Pass --approve after human review, or use --verified-recipe only with "
+                "a diagnosis report whose policy marks the recipe manually verified."
             ),
         }
 
@@ -438,6 +459,11 @@ def run_remediation(
     try:
         _validate_project(root)
 
+        if verified_recipe and diagnosis_report is None:
+            raise ValueError(
+                "Verified-recipe authorization requires --diagnosis-report evidence"
+            )
+
         if (
             os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
             and diagnosis_report is None
@@ -452,6 +478,7 @@ def run_remediation(
                 diagnosis_report,
                 expected_source_sha=expected_source_sha,
                 expected_source_branch=expected_source_branch,
+                require_verified_recipe=verified_recipe,
             )
 
         originals, proposed, preconditions = _prepare_changes(root)
@@ -478,9 +505,14 @@ def run_remediation(
         "schema_version": 2,
         "recipe_id": RECIPE_ID,
         "started_at": _now(),
+        "verified_recipe": bool(verified_recipe),
         "approval": {
             "type": "prior_github_environment_approval_or_explicit_local_cli_flag",
-            "received": True,
+            "received": bool(approved),
+        },
+        "authorization": {
+            "type": "manually_verified_recipe" if verified_recipe else "human_approval",
+            "granted": True,
         },
         "applicability": {
             "strategy": (
@@ -550,7 +582,11 @@ def run_remediation(
             if not item["passed"]:
                 raise RuntimeError(f"Validation failed: {label}")
 
-        audit["status"] = "validated_pending_commit_approval"
+        audit["status"] = (
+            "validated_verified_pending_commit"
+            if verified_recipe
+            else "validated_pending_commit_approval"
+        )
         audit["message"] = (
             "Context-aware recipe applied and all validations passed. "
             "No commit, push, or CI retry was performed."
@@ -624,6 +660,14 @@ def main() -> int:
         help="Confirm the prior human approval for this specific recipe execution.",
     )
     parser.add_argument(
+        "--verified-recipe",
+        action="store_true",
+        help=(
+            "Authorize execution only when the diagnosis report confirms the recipe "
+            "was manually marked verified in the rules configuration."
+        ),
+    )
+    parser.add_argument(
         "--diagnosis-report",
         type=Path,
         help=(
@@ -644,6 +688,7 @@ def main() -> int:
     code, report = run_remediation(
         args.project_root,
         approved=args.approve,
+        verified_recipe=args.verified_recipe,
         diagnosis_report=args.diagnosis_report,
         expected_source_sha=args.expected_source_sha,
         expected_source_branch=args.expected_source_branch,
