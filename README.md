@@ -2,7 +2,7 @@
 
 A Python-based, rule-driven CI/CD failure diagnosis and controlled remediation prototype for GitHub Actions. The current implementation uses a Node.js frontend as its demonstration application and performs deterministic recovery without an AI model.
 
-The default workflow uses two separate human approval gates, isolated remediation, validation, an auditable patch handoff, and an explicitly dispatched post-remediation CI run. A manually maintained `verified` flag can bypass those human gates for a recipe that has already been verified; all execution, validation, patch-integrity, branch-safety, commit/push, and post-push CI checks remain active.
+The workflow is designed around two separate human approval gates, isolated remediation, validation, an auditable patch handoff, an approved commit/push, and an explicitly dispatched post-remediation CI run.
 
 > **Current implementation status:** pre-merge feature-branch testing mode. The active diagnostic workflow is triggered by pushes to `feature/**` and checks out the controller from the same feature-branch commit. This mode is intended for controlled testing on trusted branches. It is not the final production trust boundary for untrusted contributor branches.
 
@@ -25,8 +25,7 @@ The default workflow uses two separate human approval gates, isolated remediatio
 13. [Commit, push, and post-remediation CI](#commit-push-and-post-remediation-ci)
 14. [Permissions and security model](#permissions-and-security-model)
 15. [Troubleshooting](#troubleshooting)
-16. [Operator checklist](#operator-checklist)
-17. [Known limitations and next work](#known-limitations-and-next-work)
+16. [Known limitations and next work](#known-limitations-and-next-work)
 
 ---
 
@@ -38,11 +37,11 @@ The project aims to:
 - Redact common credential patterns before producing diagnosis evidence.
 - Classify failures using deterministic rules in `config/rules.yaml`.
 - Evaluate whether a failure is eligible for a controlled remediation recipe.
-- Require human approval before executing a remediation by default; allow a manually verified recipe to use the explicit no-human-gate path.
+- Require human approval before executing a remediation.
 - Apply narrowly scoped source changes in a temporary GitHub Actions workspace.
 - Validate the changes before creating any commit.
 - Preserve the validated patch and audit evidence for human review.
-- Require a second, independent human approval before commit and push on the default path; skip both approval gates only when the exact recipe is manually marked verified.
+- Require a second, independent human approval before commit and push.
 - Explicitly dispatch the frontend CI workflow after the remediation push and record its result.
 
 ### What is implemented today
@@ -51,11 +50,11 @@ The project aims to:
 - A policy evaluator that identifies remediation eligibility and approval requirements.
 - A dedicated unknown-failure route that creates a sanitized engineering-triage record without entering either approval gate.
 - One deterministic executor recipe: `frontend_title_mismatch_v2`.
-- Two GitHub Environment approval gates and two configurable watchdogs on the default path.
-- A manually controlled, per-recipe `verified` flag that can bypass those gates after the recipe has been verified.
+- Two GitHub Environment approval gates.
+- A configurable approval deadline enforced by watchdog jobs.
 - Semantic precondition checks, bounded transformations, atomic file writes, validation, and rollback on validation/execution failure.
 - A patch and audit handoff with SHA-256 integrity checks.
-- An authorized commit/push and post-push `workflow_dispatch` of `Frontend CI`.
+- An approved commit/push and post-push `workflow_dispatch` of `Frontend CI`.
 
 ### What is not implemented
 
@@ -81,49 +80,40 @@ Developer pushes to feature/*
        Frontend CI                Frontend Failure Diagnostics
        (Node.js)                  (Python controller)
             |                              |
-            |                         Match exact run / branch / SHA
+            |                         Wait for exact CI
+            |                         run / branch / SHA
             |                              |
-            |                         Retrieve failed logs
-            |                         redact + classify by rules
+            |                         Retrieve failed jobs
+            |                         and sanitized logs
             |                              |
-            |                        Failure route decision
-            |                  ____________|____________
-            |                 |                         |
-            |              UNKNOWN                Supported recipe
-            |                 |                         |
-            |        Manual triage artifact       Is recipe manually
-            |        No approval/remediation      marked verified?
-            |        No commit/push/retry          /             \
-            |                 |                  YES              NO
-            |                END                  |                |
-            |                                     |          First human approval
-            |                                     |                |
-            |                                     +--------+-------+
-            |                                              |
-            |                                   Deterministic remediation
-            |                                   + npm test + npm run build
-            |                                   + rollback on failure
-            |                                              |
-            |                                      Patch + audit handoff
-            |                                              |
-            |                                       Automated integrity
-            |                                           review
-            |                                              |
-            |                         verified path ------+------ approval path
-            |                         skips second gate             |
-            |                                              |
-            |                                   Second human approval
-            |                                   (approval path only)
-            |                                              |
-            |                                     Verify patch + SHA
-            |                                     Commit + push
-            |                                              |
-            |                                    Explicit Frontend CI
-            |                                    workflow_dispatch
-            |                                              |
-            +<---------------------------------------------+
-                       Verify exact remediation SHA
-                       and record final CI result
+            |                         Match deterministic rules
+            |                              |
+            |                       Supported recipe?
+            |                         /           \
+            |                       YES          UNKNOWN
+            |                        |              |
+            |                First human          Build manual
+            |                approval             triage artifact
+            |                        |              |
+            |                Deterministic          Human engineering
+            |                remediation            investigation
+            |                        |              |
+            |                Validate + rollback     END
+            |                        |
+            |                Patch review
+            |                        |
+            |                Second human approval
+            |                        |
+            |                Verify patch + SHA
+            |                        |
+            |                Commit + push
+            |                        |
+            |                Explicit Frontend CI
+            |                workflow_dispatch
+            |                        |
+            +<-----------------------+
+                 Verify exact remediation SHA
+                 and record final CI result
 ```
 
 The workflows are separate:
@@ -131,7 +121,7 @@ The workflows are separate:
 - `.github/workflows/frontend-ci.yml` runs the application CI pipeline.
 - `.github/workflows/debug-frontend.yml` runs diagnosis, approval, remediation, review, commit/push, and post-push verification.
 
-The Python controller lives under `src/cicd_recovery/`. Rules are externalized in `config/rules.yaml`; remediation logic is intentionally implemented in code rather than accepting arbitrary shell commands from rules or log content. The `verified` property is a manual, per-recipe policy flag: `false` keeps both human approval gates and watchdogs; `true` bypasses only those gates for the exact supported recipe. Automated validation, patch review/integrity, source-SHA checks, commit/push authorization, and post-push CI verification remain in the path. Unknown and mixed-unknown failures are always routed to investigation only.
+The Python controller lives under `src/cicd_recovery/`. Rules are externalized in `config/rules.yaml`; remediation logic is intentionally implemented in code rather than accepting arbitrary shell commands from rules or log content.
 
 ---
 
@@ -166,7 +156,7 @@ The controller:
 6. Applies the ordered deterministic rules from `config/rules.yaml`.
 7. Creates a JSON report and GitHub Actions job summary.
 
-For the current supported recipe, the workflow additionally checks that the diagnosis contains exactly one analysis, the `unit_test_failure` category/rule, an eligible policy decision (either the normal approval-required decision or the manually verified-recipe decision), and both title strings in the sanitized log excerpt:
+For the current supported recipe, the workflow additionally checks that the diagnosis contains exactly one analysis, the `unit_test_failure` category/rule, an eligible approval-required policy decision, and both title strings in the sanitized log excerpt:
 
 - `CI/CD Recovery Demo`
 - `CI/CD Recovery Dashboard`
@@ -229,7 +219,7 @@ After patch review succeeds, GitHub requests a **new approval** through `remedia
 
 This is a separate environment gate from `remediation-approval`. The first approval cannot satisfy the second gate. The second watchdog also checks that the first approval is present in GitHub's approval history before it accepts the second approval.
 
-On the default path, the second approval authorizes committing and pushing the validated patch to the originating feature branch. The manually verified path bypasses this second human gate but still requires the final integrity and source-revision checks.
+The second approval authorizes committing and pushing the validated patch to the originating feature branch.
 
 ### 7. Commit and push
 
@@ -322,11 +312,9 @@ intelligent-cicd-recovery-ai/
 │   ├── test_github_api.py
 │   ├── test_policy.py
 │   ├── test_redaction.py
-│   ├── test_remediation_executor.py
 │   ├── test_remediation_reporting.py
 │   ├── test_rules.py
-│   ├── test_run_scope.py
-│   └── test_workflow_unknown_routing.py
+│   └── test_run_scope.py
 ├── .env.example
 ├── .gitignore
 ├── pyproject.toml
@@ -495,13 +483,11 @@ The remediation executor runs `npm test` and `npm run build` in `frontend/`. Eac
 
 The supported demonstration failure is a mismatch between the frontend HTML title and the expected product title.
 
-The known failing demonstration state is:
+The original failing state is:
 
 - `frontend/src/index.html` has the title `CI/CD Recovery Demo`.
 - `frontend/test/app.test.js` contains an assertion for the old title.
 - `frontend/test/known-issue-demo.test.js` deliberately expects `CI/CD Recovery Dashboard` while its test stub reports the old title, so the test fails.
-
-The project has also been exercised in its corrected, passing state. To repeat the remediation demonstration, restore the known failing state on a disposable or trusted feature branch before pushing. Do not introduce this known failure on the default branch.
 
 Run locally to confirm the failure:
 
@@ -550,7 +536,7 @@ on:
   workflow_dispatch:
 ```
 
-It runs in `frontend/` and performs:
+It runs in `frontend/` and currently performs:
 
 1. Checkout repository.
 2. Setup Node.js 26.
@@ -558,33 +544,6 @@ It runs in `frontend/` and performs:
 4. `npm test`.
 5. `npm run build`.
 6. Upload `frontend/dist/` as the `frontend-dist` artifact.
-7. While the unknown-route test hook is enabled, print the trigger context and optionally inject a controlled, unmatched failure.
-
-#### Temporary unknown-failure test hook
-
-The current test version of `frontend-ci.yml` includes a temporary step named `Inject controlled unknown failure`. It runs only when both conditions are true:
-
-- The workflow event is `push`.
-- At least one commit included in that push has `[simulate-unknown-failure]` in its commit message.
-
-The injected step prints this deliberately unmatched signature and exits with code `73`:
-
-```text
-RECOVERY_TEST_SIGNAL=UNMAPPED_PIPELINE_STATE_7419
-```
-
-To exercise the unknown-failure route after the test hook has been added, push a dedicated marker commit to a trusted `feature/**` branch:
-
-```bash
-git commit --allow-empty -m "Test unknown failure routing [simulate-unknown-failure]"
-git push origin feature/controllertest
-```
-
-Use your actual feature branch name if it differs. The regular install, test, build, and artifact-upload steps run before the injected failure. The marker step is intended to test routing only after those normal steps pass. The diagnostic workflow should classify the new signature as `unknown`, run `unknown-failure-triage`, and upload `unknown-failure-triage-<run-id>`. Both approval gates, both approval watchdogs, remediation, patch review, commit/push, and post-push dispatch must remain skipped for this unknown run.
-
-The step `Show unknown-failure test trigger context` prints the event, ref, and whether the pushed commits contain the marker. If injection is skipped, inspect this step's output first.
-
-**Remove both temporary unknown-failure test steps from `frontend-ci.yml` after validating the route.** Do not leave a deliberate failure injector enabled for normal CI use. The local fixture `fixtures/logs/unknown_failure.log` can still be used for local diagnosis without forcing a GitHub Actions failure.
 
 The `workflow_dispatch` trigger must be present in the `Frontend CI` workflow on the repository's default branch for the post-remediation dispatch step to work. The dispatcher selects the originating feature branch as the `ref`, and the resulting run is verified against the exact remediation commit SHA.
 
@@ -599,16 +558,7 @@ on:
       - "feature/**"
 ```
 
-The diagnostic workflow waits for the Frontend CI run corresponding to the exact push SHA. It uses the current feature-branch commit for the controller checkout. After the required approval gates (or the manually verified bypass) and patch checks, it commits and pushes only to the originating feature branch.
-
-### End-to-end route expectations
-
-| Failure and recipe state | Expected route | What must not happen |
-|---|---|---|
-| Supported title-mismatch failure, `verified: false` | First approval → remediation and validation → automated patch review → second approval → commit/push → explicit Frontend CI | Commit/push before the second approval; retrying the original run automatically |
-| Supported title-mismatch failure, `verified: true` | Remediation and validation directly → automated patch review → commit/push → explicit Frontend CI | Both approval jobs and both approval watchdogs; bypassing validation, patch-integrity, or source-SHA checks |
-| Unknown or mixed-unknown failure, either flag value | Unknown triage artifact for engineering investigation | Any approval gate, watchdog, remediation, patch review, commit, push, or CI retry |
-| Frontend CI succeeds | Diagnostic job records the successful result and skips failure diagnosis/remediation | Running remediation on a successful CI run |
+The diagnostic workflow waits for the Frontend CI run corresponding to the exact push SHA. It uses the current feature-branch commit for the controller checkout. After all approval gates and patch checks, it commits and pushes only to the originating feature branch.
 
 ### Repository environments
 
@@ -662,7 +612,7 @@ No `APP_CLIENT_ID`, `APP_PRIVATE_KEY`, or `APP_BOT_LOGIN` values are required in
 
 ## Human approval gates and deadlines
 
-The default (`verified: false`) path has two independent human approval events. When the supported recipe is manually marked `verified: true`, both approval stages and their watchdogs are skipped; the automated patch-integrity and source-revision checks still run before the final commit/push job.
+There are two independent approval events in the workflow.
 
 | Gate | Environment | What it authorizes | Deadline |
 |---|---|---|---|
@@ -682,7 +632,7 @@ Approval is enforced by GitHub Environment protection rules; the watchdog provid
 
 ### Approval scenario matrix
 
-The following table describes the expected behavior for the important approval and handoff scenarios on the default path, plus the manually verified-recipe bypass. On the default path, the first and second approval windows are independent. Each window begins at its own clock job; the second clock does not start until patch review succeeds.
+The following table describes the expected behavior for the important approval and handoff scenarios. The first and second approval windows are independent. Each window begins at its own clock job; the second clock does not start until patch review succeeds.
 
 | Scenario | First approval gate | Second approval gate | Expected workflow behavior |
 |---|---|---|---|
@@ -698,7 +648,6 @@ The following table describes the expected behavior for the important approval a
 | Second environment starts without a verifiable approval record | First gate must still be recorded as approved | Second environment job has no matching approval-history record | Second watchdog fails closed and cancels after its 60-second configuration-detection window. |
 | Second approval is granted, but the feature branch has advanced | First gate approved | Second gate independently approved | Commit job detects that the branch SHA differs from the diagnosed source SHA and stops. A new diagnosis, patch review, and approval cycle is required. |
 | Both approvals pass and the source SHA is unchanged | First gate approved | Second gate approved | The exact reviewed patch can be verified, staged, committed, and pushed to the originating feature branch. |
-| Recipe has `verified: true` and the diagnosis matches that exact recipe | Both approval jobs and watchdogs are skipped | Both approval jobs and watchdogs are skipped | The verified authorization path executes the recipe, validates it, verifies the patch and source SHA, commits/pushes, and explicitly runs post-push Frontend CI. |
 | Post-push Frontend CI fails | Both approvals have already passed | Both approvals have already passed | The commit remains pushed. The CI failure is recorded for human investigation; no automatic rollback or repeat remediation is triggered. |
 
 ### How to read the approval jobs in the Actions graph
@@ -751,9 +700,6 @@ remediation:
   risk: high
   mode: assisted
   approval_required: true
-  # Manually switch to true only after this exact recipe has been verified.
-  # Default false preserves both human approval gates and their watchdogs.
-  verified: false
   max_attempts: 1
 
 validation:
@@ -764,38 +710,11 @@ target_branch: originating_feature_branch
 commit_only_after_validation: true
 ```
 
-High-risk remediation requires both human approval gates by default. The `verified` flag is a manual, per-recipe override:
-
-- `verified: false` (default): preserve both GitHub Environment approval gates and both watchdogs.
-- `verified: true`: for this exact supported recipe only, skip both human approval gates and watchdogs. The executor still checks the diagnosis evidence and semantic preconditions, applies only the allowlisted transformation, runs `npm test` and `npm run build`, creates an auditable patch, verifies the patch and source SHA, commits/pushes to the originating feature branch, and explicitly dispatches Frontend CI for post-push verification.
-
-The flag is never inferred from logs, diagnosis confidence, or AI. A maintainer must manually set it to `true` only after verifying the recipe and its expected behavior. Keep it `false` until that review is complete. Unknown or mixed-unknown failures remain blocked from remediation, regardless of this flag. The flag does not disable validation or patch-integrity checks.
-
-#### Manually enable the verified path
-
-1. Review the exact remediation implementation, its semantic preconditions, allowlisted files, rollback behavior, and validation commands. Run the known failure and successful remediation in a disposable checkout.
-2. Open `config/rules.yaml` and locate the `unit_test_failure` rule's `remediation` block. Change only the `verified` property:
-
-   ```yaml
-   verified: true
-   ```
-
-   Keep `approval_required: true`; the explicit `verified` policy decision is the separate manual override. The default value in the repository must remain `false` unless a maintainer has deliberately approved the verified operating mode.
-3. Commit and push the configuration change to a trusted `feature/**` branch. The diagnostic workflow checks out the controller and rules from the same source commit it is diagnosing, so the `verified: true` setting must exist in the exact source commit that produces the supported failure.
-4. Inspect the `Evaluate human approval requirement` step in the diagnostic job summary. For the verified route, it should report `Supported recipe: true`, `Manually verified recipe: true`, and `Effective approval required: false`.
-5. Confirm that `first-approval-clock`, `remediation-approval`, `first-approval-watchdog`, `second-approval-clock`, `commit-approval`, and `second-approval-watchdog` are skipped. The expected continuing path is remediation execution, automated patch review, commit/push, and explicit post-push Frontend CI.
-6. After verification, manually change `verified` back to `false` when the bypass should no longer be active, then commit and push that change.
-
-The verified path applies only to the exact supported single-analysis `unit_test_failure` / `frontend_title_mismatch_v2` route. It is not a repository-wide switch for every rule. If the report contains any unknown analysis, or if the rule/signature/policy checks do not match exactly, the verified bypass is disabled and no automatic remediation is authorized.
-
-Treat `config/rules.yaml`, `.github/workflows/debug-frontend.yml`, and the remediation controller as privileged files. Protect them with branch protection and required review. A change to `verified: true` is an authorization decision, not a routine tuning change.
-
-`retry_candidate: true` is only a policy signal; it is not permission to automatically rerun a job. The verified path performs the configured remediation flow and post-push CI check, not an automatic retry of the failed CI run.
+High-risk remediation requires approval. `retry_candidate: true` is only a policy signal for future consideration; it is not permission to automatically rerun a job. No automatic retry is currently performed.
 
 ### Audit status examples
 
-- `validated_pending_commit_approval`: transformations and validation passed under the human-approved route; awaiting patch-integrity checks and the second approval.
-- `validated_verified_pending_commit`: transformations and validation passed under the manually verified-recipe route; no human approval was requested, but patch-integrity and source-revision checks still run before commit.
+- `validated_pending_commit_approval`: transformations and validation passed; awaiting patch review and the second approval.
 - `validation_failed_rolled_back`: validation failed and rollback was performed.
 - `execution_failed_rolled_back`: execution failed and rollback was performed.
 - `not_applicable`: semantic preconditions or diagnosis evidence did not match the supported recipe.
@@ -826,7 +745,7 @@ Before commit, the workflow verifies:
 
 - The manifest refers to the current repository, source run, branch, source SHA, and controller SHA.
 - The patch and audit SHA-256 values match the manifest.
-- The audit reports `validated_pending_commit_approval` for the human-approved path, or `validated_verified_pending_commit` for the manually verified path.
+- The audit reports `validated_pending_commit_approval`.
 - Both required validation commands passed.
 - The changed files match the allowlist and patch.
 - The feature branch still points to the original source SHA.
@@ -894,7 +813,7 @@ The dispatcher discovers the active workflow named `Frontend CI`. It fails close
 
 ### Current pre-merge pilot boundary
 
-The current diagnostic workflow checks out the controller from the feature-branch commit that triggered it. The final job can write to the originating feature branch after both human approvals, or after the manually verified-recipe authorization path.
+The current diagnostic workflow checks out the controller from the feature-branch commit that triggered it. The final job can write to the originating feature branch after the two approvals.
 
 This is useful for validating changes before merging the project into the default branch, but it means the workflow definition and controller are part of the feature-branch trust boundary. Restrict write access to the pilot branch and use only trusted contributors. Do not run this write-enabled pilot against untrusted fork branches or code from untrusted contributors.
 
@@ -937,25 +856,6 @@ The remediation job currently installs frontend dependencies with `npm ci --igno
 | Dispatch returns an empty body | The API accepted the dispatch with no response body | The workflow falls back to querying workflow runs by workflow ID, event, branch, SHA, and creation time. |
 | Post-push CI fails | The remediation commit was pushed but CI found another failure | Inspect the recorded CI run and artifact. The current implementation does not automatically roll back or repair again. |
 | Unknown failure is detected | No configured rule matched at least one failed job | Inspect the `unknown-failure-triage-<run-id>` artifact and sanitized log excerpt. This route intentionally bypasses both human remediation approval gates and performs no fix, commit, push or retry. |
-| `Inject controlled unknown failure` is skipped | The event is not `push`, the marker is absent from all commits in that push, or an earlier CI step failed | Inspect `Show unknown-failure test trigger context`; confirm the commit message contains `[simulate-unknown-failure]` and that install/tests/build/artifact upload passed. |
-| `unknown-failure-triage` is skipped after the frontend failure | The diagnosis did not classify the failed analysis as `unknown`, the diagnostic job did not find the matching source run, or the triage job's report validation failed | Inspect the diagnosis artifact, `unknown_failure` output, source run ID/SHA/branch checks, and the triage job log. |
-| Verified flag is `true` but approval jobs are not skipped | The exact supported recipe/signature did not match, there was more than one analysis, or the diagnosis report did not contain the verified policy decision | Check `config/rules.yaml` in the exact triggering commit and inspect `Evaluate human approval requirement` for `Supported recipe`, `Manually verified recipe`, and `Effective approval required`. Unknown or mixed-unknown runs must never use the bypass. |
-
----
-
-## Operator checklist
-
-Use this sequence when validating a change to this project:
-
-1. Confirm the source branch is a trusted `feature/**` branch and the working tree is clean.
-2. Run Python tests with `python -m pytest -v` and frontend checks with `npm test`, `npm run build`, `npm run lint`, and `npm run typecheck` from `frontend/`.
-3. For a supported known failure, confirm the exact title-mismatch signature and decide whether the rule remains on the default two-approval route (`verified: false`) or has been manually approved for the verified route (`verified: true`).
-4. For an unknown-failure E2E check, temporarily enable the marker-gated injector, push a commit containing `[simulate-unknown-failure]`, and verify that the diagnosis and unknown-triage artifacts are uploaded while remediation, approval, commit/push, and retry jobs remain blocked. Remove the injector after the test.
-5. For either supported remediation path, inspect the diagnosis report, remediation audit, patch manifest, SHA-256 hashes, changed-file allowlist, and final `commit-result.json`.
-6. Confirm that post-push Frontend CI ran against the exact remediation commit SHA and review its conclusion. A failed post-push run does not automatically revert the already-pushed commit.
-7. Keep `verified: false` unless there is an explicit maintainer decision to keep that exact recipe in verified mode. Keep privileged workflow/controller files protected.
-
-Do not interpret a skipped job as a failure by itself. Skips are expected for successful source CI runs, the unknown-failure route, and the verified recipe's approval/watchdog jobs. Always inspect job conditions and the diagnostic summary to confirm the intended route was selected.
 
 ---
 
@@ -966,6 +866,6 @@ Do not interpret a skipped job as a failure by itself. Skips are expected for su
 3. **Evaluate attempt tracking.** Add durable incident/run history before enforcing retry or remediation-attempt limits across separate workflow runs.
 4. **Test safety cases.** Include unsupported failures, validation failures and rollback, missing/misconfigured approval environments, approval rejection/expiry, branch advancement, patch-integrity mismatch, push rejection, dispatch failure, and post-push CI failure.
 5. **Prepare the production trust model.** Move privileged workflow orchestration to the protected default branch after review; do not make a feature-branch-controlled workflow the final production authority for write-capable actions.
-6. **Consider AI only after deterministic behavior is measured.** Any future AI component should recommend or explain actions without bypassing rule eligibility, semantic preconditions, manually configured verification state, allowlists, validation, rollback, or audit controls.
+6. **Consider AI only after deterministic behavior is measured.** Any future AI component should recommend or explain actions without bypassing rule eligibility, semantic preconditions, approvals, allowlists, validation, rollback, or audit controls.
 
 The prototype should be evaluated on repeatability, diagnosis accuracy, remediation success rate, rollback reliability, approval enforcement, audit completeness, and post-push CI outcomes. No patentability or novelty conclusion is implied by this README.
