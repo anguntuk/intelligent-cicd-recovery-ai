@@ -27,6 +27,7 @@ jobs:
     outputs:
       approval_required: ${{ steps.approval.outputs.required }}
       supported_recipe: ${{ steps.approval.outputs.supported_recipe }}
+      verified_recipe: ${{ steps.approval.outputs.verified_recipe }}
       unknown_failure: ${{ steps.approval.outputs.unknown_failure }}
       source_run_id: ${{ steps.gate.outputs.run_id }}
       source_sha: ${{ steps.gate.outputs.source_sha }}
@@ -306,19 +307,13 @@ jobs:
             [
               .analyses[]?.diagnosis.remediation_plan?
               | select(
-                  .decision == "approval_required"
-                  and .eligible == true
+                  .eligible == true
                   and .requires_approval == true
                 )
             ] | length > 0
           ' "$REPORT")
 
-          # Unknown or mixed unknown reports never enter either approval gate.
-          if [[ "$UNKNOWN_FAILURE" == "true" ]]; then
-            APPROVAL_REQUIRED="false"
-          fi
-
-          SUPPORTED_RECIPE=$(jq -r '
+          VERIFIED_RECIPE=$(jq -r '
             (.analyses // []) as $analyses
             | if ($analyses | length) != 1 then
                 false
@@ -327,14 +322,46 @@ jobs:
                 | ($d.remediation_plan // {}) as $p
                 | (
                     $d.category == "unit_test_failure"
-                    and (($analyses[0].diagnosis.unknown_triage // null) == null)
-                    and (
-                      ($d.matched_rule_ids // [])
-                      | index("unit_test_failure") != null
-                    )
-                    and $p.decision == "approval_required"
+                    and (($d.matched_rule_ids // []) | index("unit_test_failure") != null)
+                    and $p.verified == true
+                    and $p.decision == "verified_auto_execution"
                     and $p.eligible == true
-                    and $p.requires_approval == true
+                    and $p.requires_approval == false
+                  )
+              end
+          ' "$REPORT")
+
+          # Unknown or mixed unknown reports never enter either approval gate
+          # and can never use the verified-recipe bypass.
+          if [[ "$UNKNOWN_FAILURE" == "true" ]]; then
+            APPROVAL_REQUIRED="false"
+            VERIFIED_RECIPE="false"
+          fi
+
+          SUPPORTED_RECIPE=$(jq -r \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
+            (.analyses // []) as $analyses
+            | if ($analyses | length) != 1 then
+                false
+              else
+                ($analyses[0].diagnosis // {}) as $d
+                | ($d.remediation_plan // {}) as $p
+                | (
+                    $d.category == "unit_test_failure"
+                    and (($d.unknown_triage // null) == null)
+                    and (($d.matched_rule_ids // []) | index("unit_test_failure") != null)
+                    and $p.eligible == true
+                    and (
+                      ($verified_recipe == true
+                        and $p.verified == true
+                        and $p.decision == "verified_auto_execution"
+                        and $p.requires_approval == false)
+                      or
+                      ($verified_recipe == false
+                        and $p.verified == false
+                        and $p.decision == "approval_required"
+                        and $p.requires_approval == true)
+                    )
                     and (
                       ($analyses[0].sanitized_log_excerpt // "") as $excerpt
                       | (
@@ -350,16 +377,19 @@ jobs:
           EFFECTIVE_APPROVAL_REQUIRED="false"
 
           if [[ "$APPROVAL_REQUIRED" == "true" \
-            && "$SUPPORTED_RECIPE" == "true" ]]; then
+            && "$SUPPORTED_RECIPE" == "true" \
+            && "$VERIFIED_RECIPE" != "true" ]]; then
             EFFECTIVE_APPROVAL_REQUIRED="true"
           fi
 
           echo "Policy approval required: $APPROVAL_REQUIRED"
           echo "Supported recipe: $SUPPORTED_RECIPE"
+          echo "Manually verified recipe: $VERIFIED_RECIPE"
           echo "Effective approval required: $EFFECTIVE_APPROVAL_REQUIRED"
 
           echo "required=$EFFECTIVE_APPROVAL_REQUIRED" >> "$GITHUB_OUTPUT"
           echo "supported_recipe=$SUPPORTED_RECIPE" >> "$GITHUB_OUTPUT"
+          echo "verified_recipe=$VERIFIED_RECIPE" >> "$GITHUB_OUTPUT"
           echo "unknown_failure=$UNKNOWN_FAILURE" >> "$GITHUB_OUTPUT"
 
           {
@@ -368,11 +398,15 @@ jobs:
             echo ""
             echo "- Policy approval required: $APPROVAL_REQUIRED"
             echo "- Supported recipe: $SUPPORTED_RECIPE"
+            echo "- Manually verified recipe: $VERIFIED_RECIPE"
             echo "- Effective approval required: $EFFECTIVE_APPROVAL_REQUIRED"
             echo "- Unknown failure detected: $UNKNOWN_FAILURE"
             if [[ "$UNKNOWN_FAILURE" == "true" ]]; then
               echo "- Route: manual engineering investigation; no approval gate"
               echo "- Remediation/commit/push/retry: prohibited for unknown failures"
+            elif [[ "$VERIFIED_RECIPE" == "true" ]]; then
+              echo "- Route: manually verified recipe; both approval gates and watchdogs are bypassed"
+              echo "- Execution validation, patch integrity checks, commit, push, and post-push CI remain required"
             fi
             echo "- Recipe: frontend_title_mismatch_v2"
             echo "- AI: Disabled"
@@ -769,10 +803,10 @@ jobs:
 
 
   # ==================================================
-  # JOB 3: APPROVED DETERMINISTIC REMEDIATION
+  # JOB 3: AUTHORIZED DETERMINISTIC REMEDIATION
   # ==================================================
   remediation-execution:
-    name: Execute Approved Remediation and Validate
+    name: Execute Authorized Remediation and Validate
 
     needs:
       - diagnose
@@ -781,11 +815,24 @@ jobs:
 
     if: >-
       ${{
-        needs.diagnose.result == 'success'
-        && needs.remediation-approval.result == 'success'
-        && needs.first-approval-watchdog.result == 'success'
+        always()
+        && needs.diagnose.result == 'success'
         && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
+        && (
+          (
+            needs.diagnose.outputs.approval_required == 'true'
+            && needs.remediation-approval.result == 'success'
+            && needs.first-approval-watchdog.result == 'success'
+          )
+          ||
+          (
+            needs.diagnose.outputs.verified_recipe == 'true'
+            && needs.diagnose.outputs.approval_required == 'false'
+            && needs.remediation-approval.result == 'skipped'
+            && needs.first-approval-watchdog.result == 'skipped'
+          )
+        )
       }}
 
     runs-on: ubuntu-latest
@@ -830,6 +877,7 @@ jobs:
           SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
           SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
           SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+          VERIFIED_RECIPE: ${{ needs.diagnose.outputs.verified_recipe }}
 
         run: |
           set -euo pipefail
@@ -853,7 +901,8 @@ jobs:
             --arg repo "$REPOSITORY" \
             --arg run "$SOURCE_RUN_ID" \
             --arg sha "$SOURCE_SHA" \
-            --arg branch "$SOURCE_BRANCH" '
+            --arg branch "$SOURCE_BRANCH" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
               .repository == $repo
               and ((.workflow_run.id | tostring) == $run)
               and .workflow_run.head_sha == $sha
@@ -864,9 +913,18 @@ jobs:
                 (.analyses[0].diagnosis.matched_rule_ids // [])
                 | index("unit_test_failure") != null
               )
-              and .analyses[0].diagnosis.remediation_plan.decision == "approval_required"
               and .analyses[0].diagnosis.remediation_plan.eligible == true
-              and .analyses[0].diagnosis.remediation_plan.requires_approval == true
+              and (
+                if $verified_recipe then
+                  .analyses[0].diagnosis.remediation_plan.verified == true
+                  and .analyses[0].diagnosis.remediation_plan.decision == "verified_auto_execution"
+                  and .analyses[0].diagnosis.remediation_plan.requires_approval == false
+                else
+                  .analyses[0].diagnosis.remediation_plan.verified == false
+                  and .analyses[0].diagnosis.remediation_plan.decision == "approval_required"
+                  and .analyses[0].diagnosis.remediation_plan.requires_approval == true
+                end
+              )
               and (
                 (.analyses[0].sanitized_log_excerpt // "") as $excerpt
                 | (
@@ -895,7 +953,7 @@ jobs:
           echo "Source branch: $SOURCE_BRANCH"
           echo "Source SHA: $SOURCE_SHA"
           echo "Controller SHA: $CONTROLLER_SHA"
-          echo "Approved recipe: frontend_title_mismatch_v2"
+          echo "Supported recipe: frontend_title_mismatch_v2"
 
       # STEP 5: SETUP PYTHON
       - name: Set up Python
@@ -931,7 +989,7 @@ jobs:
           npm ci --ignore-scripts --no-audit --no-fund
 
             # STEP 9: EXECUTE REMEDIATION AND CREATE REVIEWABLE PATCH
-      - name: Execute approved unit test remediation
+      - name: Execute authorized unit test remediation
         id: remediation
         shell: bash
         env:
@@ -939,11 +997,12 @@ jobs:
           SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
           SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
           CONTROLLER_SHA: ${{ needs.diagnose.outputs.controller_sha }}
+          VERIFIED_RECIPE: ${{ needs.diagnose.outputs.verified_recipe }}
 
         run: |
           set -euo pipefail
 
-          echo "Executing approved deterministic remediation."
+          echo "Executing deterministic remediation under the selected authorization mode."
           echo "Recipe: frontend_title_mismatch_v2"
           echo "Source branch: $SOURCE_BRANCH"
           echo "Source SHA: $SOURCE_SHA"
@@ -967,9 +1026,18 @@ jobs:
 
           set +e
 
+          AUTHORIZATION_ARGS=()
+          if [[ "$VERIFIED_RECIPE" == "true" ]]; then
+            echo "Authorization: manually verified recipe; approval gates bypassed."
+            AUTHORIZATION_ARGS+=(--verified-recipe)
+          else
+            echo "Authorization: prior human approval."
+            AUTHORIZATION_ARGS+=(--approve)
+          fi
+
           python -m cicd_recovery.remediation \
             --project-root "$GITHUB_WORKSPACE/source" \
-            --approve \
+            "${AUTHORIZATION_ARGS[@]}" \
             --diagnosis-report "$GITHUB_WORKSPACE/$REPORT" \
             --expected-source-sha "$SOURCE_SHA" \
             --expected-source-branch "$SOURCE_BRANCH" \
@@ -1003,19 +1071,37 @@ jobs:
             exit "$EXIT_CODE"
           fi
 
-          if [[ "$STATUS" != "validated_pending_commit_approval" ]]; then
-            echo "::error::Unexpected remediation status: $STATUS"
+          EXPECTED_STATUS="validated_pending_commit_approval"
+          if [[ "$VERIFIED_RECIPE" == "true" ]]; then
+            EXPECTED_STATUS="validated_verified_pending_commit"
+          fi
+
+          if [[ "$STATUS" != "$EXPECTED_STATUS" ]]; then
+            echo "::error::Unexpected remediation status: $STATUS (expected $EXPECTED_STATUS)"
             exit 1
           fi
 
           # Verify the audit before creating a commit handoff.
           jq -e \
             --arg source_sha "$SOURCE_SHA" \
-            --arg source_branch "$SOURCE_BRANCH" '
+            --arg source_branch "$SOURCE_BRANCH" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
               .schema_version == 2
               and .recipe_id == "frontend_title_mismatch_v2"
-              and .status == "validated_pending_commit_approval"
-              and .approval.received == true
+              and .verified_recipe == $verified_recipe
+              and (
+                if $verified_recipe then
+                  .status == "validated_verified_pending_commit"
+                  and .approval.received == false
+                  and .authorization.type == "manually_verified_recipe"
+                  and .authorization.granted == true
+                else
+                  .status == "validated_pending_commit_approval"
+                  and .approval.received == true
+                  and .authorization.type == "human_approval"
+                  and .authorization.granted == true
+                end
+              )
               and .applicability.diagnosis.source_sha == $source_sha
               and .applicability.diagnosis.source_branch == $source_branch
               and (.changed_files | type) == "array"
@@ -1114,6 +1200,7 @@ jobs:
             --arg patch_sha256 "$PATCH_SHA256" \
             --arg audit_sha256 "$AUDIT_SHA256" \
             --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" \
             --argjson changed_files "$CHANGED_FILES_JSON" \
             '{
               schema_version: 1,
@@ -1123,6 +1210,7 @@ jobs:
               source_sha: $source_sha,
               source_branch: $source_branch,
               controller_sha: $controller_sha,
+              verified_recipe: $verified_recipe,
               generated_at: $generated_at,
               patch_file: "remediation.patch",
               patch_sha256: $patch_sha256,
@@ -1211,6 +1299,7 @@ jobs:
           SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
           SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
           CONTROLLER_SHA: ${{ needs.diagnose.outputs.controller_sha }}
+          VERIFIED_RECIPE: ${{ needs.diagnose.outputs.verified_recipe }}
 
         run: |
           set -euo pipefail
@@ -1227,7 +1316,8 @@ jobs:
             --arg run_id "$SOURCE_RUN_ID" \
             --arg source_sha "$SOURCE_SHA" \
             --arg source_branch "$SOURCE_BRANCH" \
-            --arg controller_sha "$CONTROLLER_SHA" '
+            --arg controller_sha "$CONTROLLER_SHA" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
               .schema_version == 1
               and .recipe_id == "frontend_title_mismatch_v2"
               and .repository == $repository
@@ -1235,6 +1325,7 @@ jobs:
               and .source_sha == $source_sha
               and .source_branch == $source_branch
               and .controller_sha == $controller_sha
+              and .verified_recipe == $verified_recipe
               and .patch_file == "remediation.patch"
               and .audit_file == "audit.json"
               and (.changed_files | type) == "array"
@@ -1262,11 +1353,24 @@ jobs:
           jq -e \
             --arg source_sha "$SOURCE_SHA" \
             --arg source_branch "$SOURCE_BRANCH" \
-            --argjson manifest_files "$MANIFEST_FILES" '
+            --argjson manifest_files "$MANIFEST_FILES" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
               .schema_version == 2
               and .recipe_id == "frontend_title_mismatch_v2"
-              and .status == "validated_pending_commit_approval"
-              and .approval.received == true
+              and .verified_recipe == $verified_recipe
+              and (
+                if $verified_recipe then
+                  .status == "validated_verified_pending_commit"
+                  and .approval.received == false
+                  and .authorization.type == "manually_verified_recipe"
+                  and .authorization.granted == true
+                else
+                  .status == "validated_pending_commit_approval"
+                  and .approval.received == true
+                  and .authorization.type == "human_approval"
+                  and .authorization.granted == true
+                end
+              )
               and .applicability.diagnosis.source_sha == $source_sha
               and .applicability.diagnosis.source_branch == $source_branch
               and .changed_files == $manifest_files
@@ -1292,7 +1396,7 @@ jobs:
           echo "Patch and audit evidence verified."
 
           {
-            echo "## Validated remediation patch — ready for review"
+            echo "## Validated remediation patch — ready for commit controls"
             echo ""
             echo "- Recipe: frontend_title_mismatch_v2"
             echo "- Source branch: $SOURCE_BRANCH"
@@ -1324,10 +1428,14 @@ jobs:
             cat review/remediation.patch
             echo '```'
             echo ""
-            echo "### Approval boundary"
+            echo "### Commit boundary"
             echo ""
-            echo "No commit or push has been performed."
-            echo "A second human approval is required before the commit job can run."
+            echo "No commit or push has been performed by the executor."
+            if [[ "$VERIFIED_RECIPE" == "true" ]]; then
+              echo "The manually verified recipe bypasses both human approval gates; patch integrity and source-revision checks still run before commit."
+            else
+              echo "A second human approval is required before the commit job can run."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
     # ==================================================
@@ -1342,6 +1450,7 @@ jobs:
       ${{
         needs.diagnose.result == 'success'
         && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
         && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
@@ -1375,6 +1484,7 @@ jobs:
       ${{
         needs.diagnose.result == 'success'
         && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
         && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
@@ -1419,6 +1529,7 @@ jobs:
       ${{
         needs.diagnose.result == 'success'
         && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.approval_required == 'true'
         && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
@@ -1587,10 +1698,10 @@ jobs:
 
 
   # ==================================================
-  # JOB 6: COMMIT AND PUSH AFTER SECOND APPROVAL
+  # JOB 6: COMMIT AND PUSH AFTER REQUIRED AUTHORIZATION
   # ==================================================
   commit-push:
-    name: Commit Approved Remediation and Verify Post-Push CI
+    name: Commit Authorized Remediation and Verify Post-Push CI
 
     needs:
       - diagnose
@@ -1600,24 +1711,37 @@ jobs:
 
     if: >-
       ${{
-        needs.diagnose.result == 'success'
+        always()
+        && needs.diagnose.result == 'success'
         && needs.remediation-review.result == 'success'
-        && needs.commit-approval.result == 'success'
-        && needs.second-approval-watchdog.result == 'success'
         && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
+        && (
+          (
+            needs.diagnose.outputs.approval_required == 'true'
+            && needs.commit-approval.result == 'success'
+            && needs.second-approval-watchdog.result == 'success'
+          )
+          ||
+          (
+            needs.diagnose.outputs.verified_recipe == 'true'
+            && needs.diagnose.outputs.approval_required == 'false'
+            && needs.commit-approval.result == 'skipped'
+            && needs.second-approval-watchdog.result == 'skipped'
+          )
+        )
       }}
 
     runs-on: ubuntu-latest
-    # Only this post-approval job can push and explicitly dispatch Frontend CI.
+    # Only this controlled job can push and explicitly dispatch Frontend CI.
     permissions:
       contents: write
       actions: write
 
     steps:
 
-      # STEP 1: DOWNLOAD THE EXACT PATCH THAT WAS REVIEWED
-      - name: Download approved remediation handoff
+      # STEP 1: DOWNLOAD THE EXACT VALIDATED PATCH
+      - name: Download validated remediation handoff
         uses: actions/download-artifact@v8
         with:
           name: validated-remediation-${{ needs.diagnose.outputs.source_run_id }}
@@ -1635,13 +1759,14 @@ jobs:
           token: ${{ github.token }}
 
       # STEP 4: VERIFY BASE SHA, MANIFEST, AUDIT AND PATCH
-      - name: Verify approved patch and source revision
+      - name: Verify authorized patch and source revision
         shell: bash
         env:
           SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
           SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
           SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
           CONTROLLER_SHA: ${{ needs.diagnose.outputs.controller_sha }}
+          VERIFIED_RECIPE: ${{ needs.diagnose.outputs.verified_recipe }}
 
         run: |
           set -euo pipefail
@@ -1663,7 +1788,8 @@ jobs:
             --arg run_id "$SOURCE_RUN_ID" \
             --arg source_sha "$SOURCE_SHA" \
             --arg source_branch "$SOURCE_BRANCH" \
-            --arg controller_sha "$CONTROLLER_SHA" '
+            --arg controller_sha "$CONTROLLER_SHA" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
               .schema_version == 1
               and .recipe_id == "frontend_title_mismatch_v2"
               and .repository == $repository
@@ -1671,6 +1797,7 @@ jobs:
               and .source_sha == $source_sha
               and .source_branch == $source_branch
               and .controller_sha == $controller_sha
+              and .verified_recipe == $verified_recipe
               and .patch_file == "remediation.patch"
               and .audit_file == "audit.json"
               and (.changed_files | type) == "array"
@@ -1684,12 +1811,12 @@ jobs:
           ACTUAL_AUDIT_SHA=$(sha256sum review/audit.json | awk '{print $1}')
 
           if [[ "$ACTUAL_PATCH_SHA" != "$EXPECTED_PATCH_SHA" ]]; then
-            echo "::error::Approved patch SHA256 mismatch."
+            echo "::error::Patch SHA256 mismatch."
             exit 1
           fi
 
           if [[ "$ACTUAL_AUDIT_SHA" != "$EXPECTED_AUDIT_SHA" ]]; then
-            echo "::error::Approved audit SHA256 mismatch."
+            echo "::error::Audit SHA256 mismatch."
             exit 1
           fi
 
@@ -1698,11 +1825,24 @@ jobs:
           jq -e \
             --arg source_sha "$SOURCE_SHA" \
             --arg source_branch "$SOURCE_BRANCH" \
-            --argjson manifest_files "$MANIFEST_FILES" '
+            --argjson manifest_files "$MANIFEST_FILES" \
+            --argjson verified_recipe "$VERIFIED_RECIPE" '
               .schema_version == 2
               and .recipe_id == "frontend_title_mismatch_v2"
-              and .status == "validated_pending_commit_approval"
-              and .approval.received == true
+              and .verified_recipe == $verified_recipe
+              and (
+                if $verified_recipe then
+                  .status == "validated_verified_pending_commit"
+                  and .approval.received == false
+                  and .authorization.type == "manually_verified_recipe"
+                  and .authorization.granted == true
+                else
+                  .status == "validated_pending_commit_approval"
+                  and .approval.received == true
+                  and .authorization.type == "human_approval"
+                  and .authorization.granted == true
+                end
+              )
               and .applicability.diagnosis.source_sha == $source_sha
               and .applicability.diagnosis.source_branch == $source_branch
               and .changed_files == $manifest_files
@@ -1727,7 +1867,7 @@ jobs:
             echo "::error::Feature branch has advanced since diagnosis."
             echo "Expected: $SOURCE_SHA"
             echo "Actual:   $ACTUAL_SOURCE_SHA"
-            echo "A fresh diagnosis and approval are required."
+            echo "A fresh diagnosis is required before another remediation attempt."
             exit 1
           fi
 
@@ -1913,7 +2053,7 @@ jobs:
 
           {
             echo ""
-            echo "## Approved remediation committed and pushed"
+            echo "## Authorized remediation committed and pushed"
             echo ""
             echo "- Recipe: frontend_title_mismatch_v2"
             echo "- Branch: $SOURCE_BRANCH"
