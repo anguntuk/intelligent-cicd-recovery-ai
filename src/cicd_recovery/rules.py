@@ -27,6 +27,7 @@ class RemediationSpec:
     validation: tuple[str, ...]
     target_branch: str
     commit_only_after_validation: bool
+    verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,9 @@ def _parse_remediation(raw: Any, rule_id: str) -> RemediationSpec | None:
         raise ValueError(f"Rule {rule_id}: remediation mode must be one of {sorted(ALLOWED_REMEDIATION_MODES)}")
 
     approval_required = _require_bool(raw.get("approval_required", True), "approval_required", rule_id)
+    # This is a manually maintained trust flag, never inferred from logs or AI.
+    # Missing values are deliberately treated as false for backwards compatibility.
+    verified = _require_bool(raw.get("verified", False), "verified", rule_id)
     attempts = raw.get("max_attempts", 1)
     if isinstance(attempts, bool) or not isinstance(attempts, int) or not 1 <= attempts <= 3:
         raise ValueError(f"Rule {rule_id}: remediation max_attempts must be an integer from 1 to 3")
@@ -111,6 +115,7 @@ def _parse_remediation(raw: Any, rule_id: str) -> RemediationSpec | None:
         validation=validation,
         target_branch=target,
         commit_only_after_validation=commit_after_validation,
+        verified=verified,
     )
 
 

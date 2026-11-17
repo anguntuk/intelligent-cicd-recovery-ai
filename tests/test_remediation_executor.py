@@ -343,3 +343,103 @@ def test_known_issue_transform_preserves_crlf_line_endings():
     assert state == "updated"
     assert "\r\n" in transformed
     assert "\n" not in transformed.replace("\r\n", "")
+
+
+def test_verified_recipe_authorization_requires_verified_diagnosis_and_records_no_human_approval(
+    tmp_path, monkeypatch
+):
+    make_project(tmp_path)
+    monkeypatch.setattr(remediation.subprocess, "run", successful_process)
+
+    diagnosis_path = tmp_path / "diagnosis-verified.json"
+    diagnosis_path.write_text(
+        json.dumps({
+            "workflow_run": {
+                "head_sha": "c" * 40,
+                "head_branch": "feature/demo",
+            },
+            "analyses": [{
+                "diagnosis": {
+                    "category": "unit_test_failure",
+                    "matched_rule_ids": ["unit_test_failure"],
+                    "remediation_plan": {
+                        "decision": "verified_auto_execution",
+                        "eligible": True,
+                        "requires_approval": False,
+                        "verified": True,
+                    },
+                },
+                "sanitized_log_excerpt": (
+                    "AssertionError: actual CI/CD Recovery Demo; "
+                    "expected CI/CD Recovery Dashboard"
+                ),
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    code, report = run_remediation(
+        tmp_path,
+        approved=False,
+        verified_recipe=True,
+        diagnosis_report=diagnosis_path,
+        expected_source_sha="c" * 40,
+        expected_source_branch="feature/demo",
+    )
+
+    assert code == 0
+    assert report["status"] == "validated_verified_pending_commit"
+    assert report["verified_recipe"] is True
+    assert report["approval"]["received"] is False
+    assert report["authorization"] == {
+        "type": "manually_verified_recipe",
+        "granted": True,
+    }
+    assert all(item["passed"] for item in report["validation"])
+    assert report["commit_performed"] is False
+    assert report["push_performed"] is False
+
+
+def test_verified_recipe_authorization_rejects_unverified_diagnosis(
+    tmp_path, monkeypatch
+):
+    make_project(tmp_path)
+    diagnosis_path = tmp_path / "diagnosis-unverified.json"
+    diagnosis_path.write_text(
+        json.dumps({
+            "workflow_run": {
+                "head_sha": "d" * 40,
+                "head_branch": "feature/demo",
+            },
+            "analyses": [{
+                "diagnosis": {
+                    "category": "unit_test_failure",
+                    "matched_rule_ids": ["unit_test_failure"],
+                    "remediation_plan": {
+                        "decision": "approval_required",
+                        "eligible": True,
+                        "requires_approval": True,
+                        "verified": False,
+                    },
+                },
+                "sanitized_log_excerpt": (
+                    "AssertionError: actual CI/CD Recovery Demo; "
+                    "expected CI/CD Recovery Dashboard"
+                ),
+            }],
+        }),
+        encoding="utf-8",
+    )
+
+    code, report = run_remediation(
+        tmp_path,
+        approved=False,
+        verified_recipe=True,
+        diagnosis_report=diagnosis_path,
+        expected_source_sha="d" * 40,
+        expected_source_branch="feature/demo",
+    )
+
+    assert code == 2
+    assert report["status"] == "not_applicable"
+    assert "explicitly marks this recipe verified" in report["message"]

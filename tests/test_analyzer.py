@@ -78,6 +78,7 @@ def test_unknown_failure_routes_to_manual_triage_without_approval() -> None:
     assert triage["ai_enabled"] is False
     assert triage["recommended_actions"]
     assert plan["decision"] == "not_configured"
+    assert plan["verified"] is False
     assert plan["eligible"] is False
     assert plan["requires_approval"] is False
     assert plan["approval_gates"] == []
@@ -109,3 +110,30 @@ def test_report_marks_unknown_failures_as_non_approval_triage() -> None:
     assert report["routing"]["unknown_failure_approval_gate"] is False
     assert report["routing"]["unknown_failure_remediation_allowed"] is False
     assert report["ai_enabled"] is False
+
+
+def test_manually_verified_rule_surfaces_no_approval_plan(tmp_path: Path) -> None:
+    rules_text = (ROOT / "config" / "rules.yaml").read_text(encoding="utf-8")
+    assert "verified: false" in rules_text
+    verified_rules_path = tmp_path / "rules.yaml"
+    verified_rules_path.write_text(
+        rules_text.replace("verified: false", "verified: true", 1),
+        encoding="utf-8",
+    )
+    rules = load_rules(verified_rules_path)
+
+    result = analyze_job(
+        job={"id": 321, "name": "Node.js frontend CI", "conclusion": "failure", "steps": []},
+        raw_log=(
+            "AssertionError: expected CI/CD Recovery Demo "
+            "to equal CI/CD Recovery Dashboard"
+        ),
+        rules=rules,
+    )
+    plan = result["diagnosis"]["remediation_plan"]
+    assert result["diagnosis"]["category"] == "unit_test_failure"
+    assert plan["verified"] is True
+    assert plan["decision"] == "verified_auto_execution"
+    assert plan["eligible"] is True
+    assert plan["requires_approval"] is False
+    assert plan["approval_gates"] == []

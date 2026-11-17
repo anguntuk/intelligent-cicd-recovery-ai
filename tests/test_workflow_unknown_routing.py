@@ -51,3 +51,33 @@ def test_diagnosis_exposes_unknown_failure_output_and_triage_upload() -> None:
     names = [step.get("name", "") for step in triage_steps]
     assert "Create manual unknown-failure triage record" in names
     assert "Upload unknown-failure triage package" in names
+
+
+def test_manually_verified_recipe_bypasses_first_and_second_approval_jobs():
+    jobs = _jobs()
+    for name in (
+        "first-approval-clock",
+        "remediation-approval",
+        "first-approval-watchdog",
+        "second-approval-clock",
+        "commit-approval",
+        "second-approval-watchdog",
+    ):
+        assert "needs.diagnose.outputs.approval_required == 'true'" in jobs[name]["if"]
+
+    execution_if = jobs["remediation-execution"]["if"]
+    assert "always()" in execution_if
+    assert "needs.diagnose.outputs.verified_recipe == 'true'" in execution_if
+    assert "needs.remediation-approval.result == 'skipped'" in execution_if
+    assert "needs.first-approval-watchdog.result == 'skipped'" in execution_if
+
+    commit_if = jobs["commit-push"]["if"]
+    assert "always()" in commit_if
+    assert "needs.diagnose.outputs.verified_recipe == 'true'" in commit_if
+    assert "needs.commit-approval.result == 'skipped'" in commit_if
+    assert "needs.second-approval-watchdog.result == 'skipped'" in commit_if
+
+
+def test_verified_recipe_flag_is_exposed_by_diagnosis_job():
+    outputs = _jobs()["diagnose"]["outputs"]
+    assert outputs["verified_recipe"] == "${{ steps.approval.outputs.verified_recipe }}"

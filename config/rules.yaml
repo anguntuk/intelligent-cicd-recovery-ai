@@ -114,6 +114,11 @@ rules:
       risk: high
       mode: assisted
       approval_required: true
+      # Manually set to true only after this exact remediation recipe is verified.
+      # When true, the workflow skips both human approval gates and watchdogs,
+      # but still executes the recipe, runs validation, verifies the patch, commits,
+      # pushes, and explicitly runs Frontend CI.
+      verified: false
       max_attempts: 1
       validation:
         - npm test
