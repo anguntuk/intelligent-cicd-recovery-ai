@@ -1,6 +1,4 @@
-
 version: 1
-
 rules:
   - id: npm_registry_timeout
     category: dependency_network_transient

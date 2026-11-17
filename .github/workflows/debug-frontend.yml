@@ -27,6 +27,7 @@ jobs:
     outputs:
       approval_required: ${{ steps.approval.outputs.required }}
       supported_recipe: ${{ steps.approval.outputs.supported_recipe }}
+      unknown_failure: ${{ steps.approval.outputs.unknown_failure }}
       source_run_id: ${{ steps.gate.outputs.run_id }}
       source_sha: ${{ steps.gate.outputs.source_sha }}
       source_branch: ${{ steps.gate.outputs.source_branch }}
@@ -296,6 +297,11 @@ jobs:
 
           REPORT="${REPORTS[0]}"
 
+          UNKNOWN_FAILURE=$(jq -r '
+            (.routing.unknown_failure_present // false) == true
+            or any(.analyses[]?; .diagnosis.category == "unknown")
+          ' "$REPORT")
+
           APPROVAL_REQUIRED=$(jq -r '
             [
               .analyses[]?.diagnosis.remediation_plan?
@@ -307,6 +313,11 @@ jobs:
             ] | length > 0
           ' "$REPORT")
 
+          # Unknown or mixed unknown reports never enter either approval gate.
+          if [[ "$UNKNOWN_FAILURE" == "true" ]]; then
+            APPROVAL_REQUIRED="false"
+          fi
+
           SUPPORTED_RECIPE=$(jq -r '
             (.analyses // []) as $analyses
             | if ($analyses | length) != 1 then
@@ -316,6 +327,7 @@ jobs:
                 | ($d.remediation_plan // {}) as $p
                 | (
                     $d.category == "unit_test_failure"
+                    and (($analyses[0].diagnosis.unknown_triage // null) == null)
                     and (
                       ($d.matched_rule_ids // [])
                       | index("unit_test_failure") != null
@@ -348,6 +360,7 @@ jobs:
 
           echo "required=$EFFECTIVE_APPROVAL_REQUIRED" >> "$GITHUB_OUTPUT"
           echo "supported_recipe=$SUPPORTED_RECIPE" >> "$GITHUB_OUTPUT"
+          echo "unknown_failure=$UNKNOWN_FAILURE" >> "$GITHUB_OUTPUT"
 
           {
             echo ""
@@ -356,6 +369,11 @@ jobs:
             echo "- Policy approval required: $APPROVAL_REQUIRED"
             echo "- Supported recipe: $SUPPORTED_RECIPE"
             echo "- Effective approval required: $EFFECTIVE_APPROVAL_REQUIRED"
+            echo "- Unknown failure detected: $UNKNOWN_FAILURE"
+            if [[ "$UNKNOWN_FAILURE" == "true" ]]; then
+              echo "- Route: manual engineering investigation; no approval gate"
+              echo "- Remediation/commit/push/retry: prohibited for unknown failures"
+            fi
             echo "- Recipe: frontend_title_mismatch_v2"
             echo "- AI: Disabled"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -372,6 +390,154 @@ jobs:
 
 
   # ==================================================
+  # JOB 1A: UNKNOWN FAILURE TRIAGE (NO APPROVAL)
+  # ==================================================
+  unknown-failure-triage:
+    name: Unknown Failure - Manual Engineering Triage (No Approval)
+    needs: diagnose
+    if: >-
+      ${{
+        needs.diagnose.result == 'success'
+        && needs.diagnose.outputs.unknown_failure == 'true'
+      }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Download diagnosis evidence
+        uses: actions/download-artifact@v8
+        with:
+          name: frontend-diagnosis-${{ needs.diagnose.outputs.source_run_id }}
+          path: diagnosis
+
+      - name: Create manual unknown-failure triage record
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+          SOURCE_RUN_ID: ${{ needs.diagnose.outputs.source_run_id }}
+          SOURCE_SHA: ${{ needs.diagnose.outputs.source_sha }}
+          SOURCE_BRANCH: ${{ needs.diagnose.outputs.source_branch }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t REPORTS < <(
+            find diagnosis -maxdepth 1 -type f -name '*.json' -print
+          )
+          if [[ "${#REPORTS[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one diagnosis report for unknown-failure triage."
+            exit 1
+          fi
+          REPORT="${REPORTS[0]}"
+
+          jq -e \
+            --arg repository "$REPOSITORY" \
+            --arg run_id "$SOURCE_RUN_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg source_branch "$SOURCE_BRANCH" '
+              .repository == $repository
+              and ((.workflow_run.id | tostring) == $run_id)
+              and .workflow_run.head_sha == $source_sha
+              and .workflow_run.head_branch == $source_branch
+              and (.analyses | length) > 0
+              and any(.analyses[]; .diagnosis.category == "unknown")
+              and .routing.unknown_failure_present == true
+              and .routing.unknown_failure_approval_gate == false
+              and .routing.unknown_failure_remediation_allowed == false
+              and all(
+                .analyses[] | select(.diagnosis.category == "unknown");
+                .diagnosis.remediation_plan.eligible == false
+                and .diagnosis.remediation_plan.requires_approval == false
+                and .diagnosis.unknown_triage.approval_required == false
+                and .diagnosis.unknown_triage.remediation_allowed == false
+                and .diagnosis.unknown_triage.commit_allowed == false
+                and .diagnosis.unknown_triage.push_allowed == false
+                and .diagnosis.unknown_triage.ci_retry_allowed == false
+              )
+            ' "$REPORT" > /dev/null
+
+          mkdir -p unknown-triage
+          cp "$REPORT" unknown-triage/diagnosis.json
+
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          report = json.loads(Path("unknown-triage/diagnosis.json").read_text(encoding="utf-8"))
+
+          def md(value):
+              text = str(value if value is not None else "not reported")
+              return (text.replace("`", "'")
+                          .replace("|", "/")
+                          .replace("<", "&lt;")
+                          .replace(">", "&gt;"))
+
+          run = report.get("workflow_run", {})
+          lines = [
+              "# Unknown CI/CD Failure - Manual Engineering Triage", "",
+              "> This incident did not match a configured deterministic rule.",
+              "> No approval was requested and no remediation action is permitted.", "",
+              "## Source context", "",
+              f"- Repository: `{md(report.get('repository'))}`",
+              f"- Workflow run: `{md(run.get('id'))}`",
+              f"- Run URL: {md(run.get('html_url'))}",
+              f"- Branch: `{md(run.get('head_branch'))}`",
+              f"- Source SHA: `{md(run.get('head_sha'))}`", "",
+              "## Findings", "",
+          ]
+          unknown = [a for a in report.get("analyses", [])
+                     if a.get("diagnosis", {}).get("category") == "unknown"]
+          for index, analysis in enumerate(unknown, 1):
+              diagnosis = analysis.get("diagnosis", {})
+              lines.extend([
+                  f"### Unknown failure {index}: {md(analysis.get('job_name'))}", "",
+                  f"- Failed job conclusion: `{md(analysis.get('job_conclusion'))}`",
+                  f"- Matched rules: none",
+                  f"- Failed steps: {md(', '.join(s.get('name', 'unnamed') for s in analysis.get('failed_steps', [])) or 'not reported')}",
+                  f"- Route: `manual_engineering_investigation`",
+                  f"- Human approval: **not requested**",
+                  f"- Remediation / commit / push / CI retry: **not permitted**", "",
+                  "#### Deterministic investigation checklist", "",
+              ])
+              triage = diagnosis.get("unknown_triage") or {}
+              for action in triage.get("recommended_actions", []):
+                  lines.append(f"- {md(action)}")
+              lines.extend(["", "#### Sanitized log excerpt", ""])
+              excerpt = analysis.get("sanitized_log_excerpt", "")
+              if excerpt:
+                  for line in excerpt.splitlines():
+                      lines.append(f"> {md(line)}")
+              else:
+                  lines.append("> No sanitized log excerpt was available.")
+              lines.append("")
+
+          lines.extend([
+              "## Required next step", "",
+              "An engineer must investigate the evidence, establish the root cause, and add a "
+              "reviewed rule plus regression fixture if the pattern is reusable. This triage "
+              "record does not authorize code changes or a retry.", "",
+          ])
+          output = "\n".join(lines)
+          Path("unknown-triage/triage-summary.md").write_text(output, encoding="utf-8")
+          summary_path = Path("unknown-triage/triage-summary.md")
+          with Path(__import__("os").environ["GITHUB_STEP_SUMMARY"]).open("a", encoding="utf-8") as stream:
+              stream.write(output + "\n")
+          print(f"Created manual triage record for {len(unknown)} unknown failure(s).")
+          PY
+
+          echo "Unknown failure triage record created. No approval gate was entered."
+
+      - name: Upload unknown-failure triage package
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: unknown-failure-triage-${{ needs.diagnose.outputs.source_run_id }}
+          path: unknown-triage/
+          if-no-files-found: error
+          retention-days: 30
+
+
+  # ==================================================
   # JOB 2: START FIRST APPROVAL WINDOW
   # ==================================================
   first-approval-clock:
@@ -381,6 +547,7 @@ jobs:
       ${{
         needs.diagnose.result == 'success'
         && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
     runs-on: ubuntu-latest
@@ -412,6 +579,7 @@ jobs:
       ${{
         needs.diagnose.result == 'success'
         && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
 
@@ -453,6 +621,7 @@ jobs:
       ${{
         needs.diagnose.result == 'success'
         && needs.diagnose.outputs.approval_required == 'true'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
     runs-on: ubuntu-latest
@@ -615,6 +784,7 @@ jobs:
         needs.diagnose.result == 'success'
         && needs.remediation-approval.result == 'success'
         && needs.first-approval-watchdog.result == 'success'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
 
@@ -1017,6 +1187,7 @@ jobs:
       ${{
         needs.diagnose.result == 'success'
         && needs.remediation-execution.result == 'success'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
 
@@ -1171,6 +1342,7 @@ jobs:
       ${{
         needs.diagnose.result == 'success'
         && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
     runs-on: ubuntu-latest
@@ -1203,6 +1375,7 @@ jobs:
       ${{
         needs.diagnose.result == 'success'
         && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
 
@@ -1246,6 +1419,7 @@ jobs:
       ${{
         needs.diagnose.result == 'success'
         && needs.remediation-review.result == 'success'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
     runs-on: ubuntu-latest
@@ -1430,6 +1604,7 @@ jobs:
         && needs.remediation-review.result == 'success'
         && needs.commit-approval.result == 'success'
         && needs.second-approval-watchdog.result == 'success'
+        && needs.diagnose.outputs.unknown_failure != 'true'
         && needs.diagnose.outputs.supported_recipe == 'true'
       }}
 

@@ -48,6 +48,7 @@ The project aims to:
 
 - Deterministic rule-based diagnosis; AI is disabled.
 - A policy evaluator that identifies remediation eligibility and approval requirements.
+- A dedicated unknown-failure route that creates a sanitized engineering-triage record without entering either approval gate.
 - One deterministic executor recipe: `frontend_title_mismatch_v2`.
 - Two GitHub Environment approval gates.
 - A configurable approval deadline enforced by watchdog jobs.
@@ -79,43 +80,40 @@ Developer pushes to feature/*
        Frontend CI                Frontend Failure Diagnostics
        (Node.js)                  (Python controller)
             |                              |
-            |                         Wait for the exact
-            |                         Frontend CI run/SHA
+            |                         Wait for exact CI
+            |                         run / branch / SHA
             |                              |
-            |                         Read run metadata,
-            |                         failed jobs and logs
+            |                         Retrieve failed jobs
+            |                         and sanitized logs
             |                              |
-            |                         Redact and classify
-            |                         with rules.yaml
+            |                         Match deterministic rules
             |                              |
-            |                         Is supported recipe?
-            |                              |
-            |                    First human approval gate
-            |                              |
-            |                         Deterministic recipe
-            |                         in isolated workspace
-            |                              |
-            |                         npm test + npm run build
-            |                              |
-            |                         Roll back on failure
-            |                              |
-            |                         Generate audit + patch
-            |                              |
-            |                         Patch review job
-            |                              |
-            |                    Second human approval gate
-            |                              |
-            |                         Verify source SHA,
-            |                         patch and file hashes
-            |                              |
-            |                         Commit + push using
-            |                         GITHUB_TOKEN
-            |                              |
-            |                         Explicit workflow_dispatch
-            |                              |
-            +<-----------------------------+
-                       Frontend CI for the exact
-                       remediation commit SHA
+            |                       Supported recipe?
+            |                         /           \
+            |                       YES          UNKNOWN
+            |                        |              |
+            |                First human          Build manual
+            |                approval             triage artifact
+            |                        |              |
+            |                Deterministic          Human engineering
+            |                remediation            investigation
+            |                        |              |
+            |                Validate + rollback     END
+            |                        |
+            |                Patch review
+            |                        |
+            |                Second human approval
+            |                        |
+            |                Verify patch + SHA
+            |                        |
+            |                Commit + push
+            |                        |
+            |                Explicit Frontend CI
+            |                workflow_dispatch
+            |                        |
+            +<-----------------------+
+                 Verify exact remediation SHA
+                 and record final CI result
 ```
 
 The workflows are separate:
@@ -164,6 +162,21 @@ For the current supported recipe, the workflow additionally checks that the diag
 - `CI/CD Recovery Dashboard`
 
 This signature check prevents a generic unit-test failure from being passed to the title-mismatch executor.
+
+### Unknown failure: manual investigation, no approval gate
+
+When no configured rule matches the sanitized failure evidence, the analyzer sets the category to `unknown` and attaches an `unknown_triage` object to the analysis. The report also marks the run-level route as `manual_engineering_investigation_only`.
+
+The workflow then takes the dedicated `unknown-failure-triage` job:
+
+1. Downloads the diagnosis report for the exact source run, branch and commit SHA.
+2. Verifies that the report identifies at least one `unknown` analysis and explicitly prohibits approval, remediation, commit, push and CI retry.
+3. Creates a triage summary with the failed job/step context, sanitized log excerpt, reason no rule matched, and a deterministic engineering investigation checklist.
+4. Uploads the diagnosis JSON and triage summary as an `unknown-failure-triage-<run-id>` artifact.
+
+**Unknown failures do not enter `remediation-approval`, `remediation-commit-approval`, or either approval watchdog.** The workflow sets the approval output to `false` whenever an unknown analysis is present, and all remediation/approval/commit jobs have an additional explicit unknown-failure exclusion. A human engineer investigates the incident outside the remediation approval process. No AI model is called, no fix is proposed automatically, and no code change or retry is authorized.
+
+This rule is deliberately conservative for mixed reports too: if any failed job is classified as unknown, the whole run is routed to manual triage and automatic remediation is blocked.
 
 ### 3. First human approval
 
@@ -749,6 +762,7 @@ If the source branch advances while awaiting review, the final job refuses to co
 | `remediation-execution-evidence-<run-id>` | Remediation audit and execution log | 14 days |
 | `validated-remediation-<run-id>` | Patch, audit, manifest, and patch statistics | 14 days |
 | `remediation-commit-result-<run-id>` | Commit information and post-push Frontend CI result | 14 days |
+| `unknown-failure-triage-<run-id>` | Diagnosis JSON plus manual investigation summary for unmatched failures; no approval or remediation | 30 days |
 
 Generated local report JSON files under `reports/` are ignored by Git. Keep artifacts as the workflow evidence for a run; do not treat temporary runner files as durable storage.
 
@@ -841,6 +855,7 @@ The remediation job currently installs frontend dependencies with `npm ci --igno
 | Frontend CI dispatch cannot find workflow | Workflow missing/inactive on default branch, `workflow_dispatch` absent, or duplicate active workflows named `Frontend CI` | Check the default-branch workflow file, trigger, name, and workflow ID. |
 | Dispatch returns an empty body | The API accepted the dispatch with no response body | The workflow falls back to querying workflow runs by workflow ID, event, branch, SHA, and creation time. |
 | Post-push CI fails | The remediation commit was pushed but CI found another failure | Inspect the recorded CI run and artifact. The current implementation does not automatically roll back or repair again. |
+| Unknown failure is detected | No configured rule matched at least one failed job | Inspect the `unknown-failure-triage-<run-id>` artifact and sanitized log excerpt. This route intentionally bypasses both human remediation approval gates and performs no fix, commit, push or retry. |
 
 ---
 
